@@ -54,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-video-duration", type=float, default=12.0, help="longest any video clip may run")
     p.add_argument("--blur-threshold", type=float, default=80.0, help="Laplacian variance below which a shot is dropped")
     p.add_argument("--llm-model", default=narrative_mod.DEFAULT_MODEL, help="OpenRouter model for narrative planning")
+    p.add_argument("--amount-labels", type=str, default="25%",
+                   help="share of clips that get a funny caption, e.g. 25%% or 0.25")
     p.add_argument("--interactive", action="store_true", help="review and edit captions before rendering")
     p.add_argument("--skip-understand", action="store_true", help="reuse cached captions/transcripts, run no models")
     p.add_argument("--skip-narrative", action="store_true", help="skip the LLM, keep chronological order")
@@ -70,13 +72,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     extra.add_argument("--preset", default="medium", help="x264 preset (ultrafast..veryslow)")
     extra.add_argument("--threads", type=int, default=0, help="encoder threads (0 = ffmpeg default)")
     extra.add_argument("--resolution", default=None, metavar="WxH", help="force output resolution, e.g. 1920x1080")
-    extra.add_argument("--no-chapters", action="store_true", help="do not draw the location header")
+    extra.add_argument("--no-location", action="store_true",
+                       help="do not draw the location line under the caption")
     extra.add_argument("--map-zoom", type=int, default=12,
                        help="map zoom: higher is closer, 12-13 keeps place names readable")
     extra.add_argument("--map-tiles", choices=["topo", "osm"], default="topo",
                        help="topo = hillshading and peak names, osm = plain street map")
-    extra.add_argument("--map-tilt", type=float, default=0.30,
-                       help="3d rake of the map, 0 = flat top-down")
+    extra.add_argument("--map-tilt", type=float, default=0.0,
+                       help="rake the whole map back into perspective, 0 = flat top-down")
+    extra.add_argument("--map-relief", type=float, default=1.0,
+                       help="3d terrain shading and height on the map, 0 = plain tiles")
+    extra.add_argument("--no-normalize-audio", action="store_true",
+                       help="do not even out clip volumes")
+    extra.add_argument("--audio-target", type=float, default=-18.0,
+                       help="target level for clip audio, dBFS")
+    extra.add_argument("--map-grow", type=float, default=2.2,
+                       help="how far the map swells while flying to a new place")
     extra.add_argument("--no-map-animation", action="store_true",
                        help="do not fly the map between locations")
     extra.add_argument("--no-geocode", action="store_true",
@@ -109,6 +120,20 @@ def load_env_file(path: Path) -> list[str]:
     except OSError as exc:
         log.warning("could not read %s: %s", path, exc)
     return loaded
+
+
+def parse_fraction(value: str, name: str) -> float:
+    """Accept "25%", "25" or "0.25" for a share."""
+    text = str(value).strip().rstrip("%")
+    try:
+        number = float(text)
+    except ValueError:
+        raise SystemExit(f"{name} must be a percentage or fraction, got {value!r}")
+    if str(value).strip().endswith("%") or number > 1.0:
+        number /= 100.0
+    if not 0.0 <= number <= 1.0:
+        raise SystemExit(f"{name} must be between 0 and 100%, got {value!r}")
+    return number
 
 
 def detect_device(requested: str | None) -> str:
@@ -179,6 +204,7 @@ def run(args: argparse.Namespace) -> int:
     timeline_path = Path(args.timeline) if args.timeline else work_dir / "timeline.json"
     plan_path = work_dir / "narrative.json"
     device = detect_device(args.device)
+    label_fraction = parse_fraction(args.amount_labels, "--amount-labels")
 
     console.print(Panel.fit(
         f"[bold]Trip video generator[/bold]\n"
@@ -259,9 +285,10 @@ def run(args: argparse.Namespace) -> int:
         plan = NarrativePlan.chronological(timeline)
         console.print("[yellow]OPENROUTER_API_KEY not set[/yellow] - chronological order, no captions")
     else:
-        with console.status(f"asking {args.llm_model} for an edit plan..."):
-            plan = narrative_mod.plan_narrative(
-                timeline, narrative_mod.NarrativeConfig(model=args.llm_model))
+        with console.status(f"asking {args.llm_model} for an edit plan "
+                            f"({round(label_fraction * len(timeline.selected))} captions)..."):
+            plan = narrative_mod.plan_narrative(timeline, narrative_mod.NarrativeConfig(
+                model=args.llm_model, label_fraction=label_fraction))
         summary_table("narrative", {
             "clips ordered": len(plan.ordered_clips),
             "captions": len(plan.captions),
@@ -275,13 +302,12 @@ def run(args: argparse.Namespace) -> int:
     # ---------------------------------------------------------- Phase 5
     phase_header(5, "Map track & places")
     map_tracks: list = []
-    place_headers: dict[int, str] = {}
 
     if not args.no_geocode:
         with console.status("looking up place names..."):
-            place_headers = map_render.resolve_places(timeline, work_dir / "places.json")
+            places = map_render.resolve_places(timeline, work_dir / "places.json")
         timeline.save(timeline_path)
-        console.print(f"[dim]locations: {', '.join(place_headers.values()) or 'none resolved'}[/dim]")
+        console.print(f"[dim]locations: {', '.join(places.values()) or 'none resolved'}[/dim]")
 
     if args.no_map or args.map_mode == "none":
         console.print("[dim]map disabled[/dim]")
@@ -292,8 +318,14 @@ def run(args: argparse.Namespace) -> int:
             zoom=args.map_zoom,
             tiles=args.map_tiles,
             tilt=args.map_tilt,
+            relief=args.map_relief,
+            move_grow=args.map_grow,
             animate=not args.no_map_animation,
         )
+        if not args.no_geocode:
+            with console.status("reading ground elevation..."):
+                map_render.resolve_elevations(timeline, map_cfg)
+            timeline.save(timeline_path)
         with console.status(f"rendering map views (zoom {args.map_zoom}, {args.map_tiles} tiles)..."):
             map_tracks = map_render.render_frames(timeline, plan.ordered_clips, map_cfg)
         if map_tracks:
@@ -310,9 +342,11 @@ def run(args: argparse.Namespace) -> int:
         map_mode="none" if (args.no_map or not map_tracks) else args.map_mode,
         resolution=parse_resolution(args.resolution),
         fps=args.fps,
+        normalize_audio=not args.no_normalize_audio,
+        clip_target_db=args.audio_target,
         preset=args.preset,
         threads=args.threads,
-        show_chapters=not args.no_chapters,
+        show_location=not args.no_location,
     )
     estimated = sum(assemble_mod.clip_duration(e, cfg) for e in timeline.selected)
     console.print(f"[dim]~{estimated / 60:.1f} min of footage at "
@@ -326,8 +360,7 @@ def run(args: argparse.Namespace) -> int:
         try:
             output = assemble_mod.assemble(
                 timeline, plan, args.music, args.output, map_tracks, cfg,
-                lambda d, t: progress.update(build_task, completed=d, total=t),
-                place_headers=place_headers)
+                lambda d, t: progress.update(build_task, completed=d, total=t))
         except Exception as exc:  # noqa: BLE001
             log.exception("assembly failed")
             console.print(f"[red]assembly failed:[/red] {exc}")

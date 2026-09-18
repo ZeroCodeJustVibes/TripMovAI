@@ -53,8 +53,8 @@ Rules:
   photo, not a travel brochure and not a description of what is visible. Think understated
   observation, gentle self-mockery, mock-heroic understatement of an ordinary moment.
   * Maximum 6 words. No final period. No emoji. No hashtags. No exclamation marks.
-  * Caption at MOST a third of the clips - jokes stop being funny at volume. Leave the
-    quiet, beautiful shots alone and let them breathe.
+  * The exact number of captions to write is given below. Spread them through the film
+    rather than bunching them, and leave the quiet, beautiful shots to breathe.
   * Because the machine caption may be wrong, never assert a specific object, animal,
     landmark or activity unless the place name or transcript backs it up. Write lines that
     stay funny even if the image is not quite what the caption claims.
@@ -70,6 +70,22 @@ Rules:
 - mood: a short phrase, e.g. "uplifting mountain adventure".
 """
 
+CAPTION_TARGET_RULE = """
+Caption EXACTLY {target} of the {count} clips - no fewer. That is the requested density,
+so pick the {target} clips with the most comic potential and write a line for each.
+"""
+
+TOP_UP_PROMPT = """You wrote {have} captions but {target} were asked for.
+
+Here are the clips you left uncaptioned. Write captions for {needed} of them, in the same
+dry, funny voice, maximum 6 words each, no emoji, no final period. Remember the machine
+captions are unreliable, so do not assert specific objects or landmarks.
+
+Reply with ONLY a JSON object of the form {{"captions": {{"<clip id>": "<caption>"}}}}.
+
+{clips}
+"""
+
 RETRY_SUFFIX = """
 
 Your previous reply was not valid JSON. Reply with the raw JSON object ONLY.
@@ -78,6 +94,7 @@ Start your reply with { and end it with }. No prose, no markdown fences."""
 
 @dataclass
 class NarrativeConfig:
+    label_fraction: float = 0.25      # share of clips that should carry a caption
     model: str = DEFAULT_MODEL
     api_key: str | None = None
     base_url: str = OPENROUTER_BASE_URL
@@ -238,12 +255,14 @@ def plan_narrative(timeline: Timeline, cfg: NarrativeConfig) -> NarrativePlan:
         return NarrativePlan()
 
     clips, lookup = _clip_payload(timeline)
+    target = max(1, round(cfg.label_fraction * len(clips)))
+    system_prompt = SYSTEM_PROMPT + CAPTION_TARGET_RULE.format(target=target, count=len(clips))
     user_message = (
         f"{_trip_context(timeline)}\n\nHere are the {len(clips)} selected clips:\n"
         f"{json.dumps(clips, ensure_ascii=False, indent=1)}"
     )
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
 
@@ -253,14 +272,16 @@ def plan_narrative(timeline: Timeline, cfg: NarrativeConfig) -> NarrativePlan:
             reply = call_openrouter(cfg, messages, json_mode=json_mode)
             raw = _extract_json(reply)
             plan = _to_plan(raw, lookup, timeline)
-            log.info("narrative plan: %d clips, %d captions, mood=%r",
-                     len(plan.ordered_clips), len(plan.captions), plan.mood)
+            if len(plan.captions) < target:
+                _top_up_captions(plan, cfg, lookup, timeline, target, json_mode)
+            log.info("narrative plan: %d clips, %d/%d captions, mood=%r",
+                     len(plan.ordered_clips), len(plan.captions), target, plan.mood)
             return plan
         except json.JSONDecodeError as exc:
             log.warning("attempt %d: model did not return valid JSON (%s)", attempt, exc)
             if attempt == 1:
                 messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT + RETRY_SUFFIX},
+                    {"role": "system", "content": system_prompt + RETRY_SUFFIX},
                     {"role": "user", "content": user_message},
                 ]
                 continue
@@ -280,6 +301,47 @@ def plan_narrative(timeline: Timeline, cfg: NarrativeConfig) -> NarrativePlan:
 
     log.warning("falling back to chronological order with no captions")
     return NarrativePlan.chronological(timeline)
+
+
+def _top_up_captions(plan: NarrativePlan, cfg: NarrativeConfig, lookup: dict[str, TimelineEntry],
+                     timeline: Timeline, target: int, json_mode: bool) -> None:
+    """Ask once more for the shortfall when the model under-delivers captions.
+
+    `--amount-labels` is a floor, not a hint, and models routinely write three
+    captions when asked for twelve. One extra call is cheaper than shipping a
+    film with a third of the jokes missing.
+    """
+    remaining = [(cid, e) for cid, e in lookup.items() if e.filepath not in plan.captions]
+    needed = min(target - len(plan.captions), len(remaining))
+    if needed <= 0:
+        return
+
+    listing = json.dumps([
+        {"id": cid, "file": e.name, "caption": e.caption or "", "place_name": e.place or ""}
+        for cid, e in remaining
+    ], ensure_ascii=False, indent=1)
+    prompt = TOP_UP_PROMPT.format(have=len(plan.captions), target=target,
+                                  needed=needed, clips=listing)
+    try:
+        reply = call_openrouter(cfg, [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ], json_mode=json_mode)
+        extra = _extract_json(reply).get("captions") or {}
+    except Exception as exc:  # noqa: BLE001 - a short plan beats no plan
+        log.warning("caption top-up failed (%s) - keeping %d captions", exc, len(plan.captions))
+        return
+
+    added = 0
+    for cid, text in extra.items():
+        entry = lookup.get(str(cid).strip())
+        if entry is None or entry.filepath in plan.captions or not text:
+            continue
+        words = str(text).strip().strip('"').rstrip(".").split()
+        if words:
+            plan.captions[entry.filepath] = " ".join(words[:6])
+            added += 1
+    log.info("caption top-up added %d caption(s)", added)
 
 
 # ------------------------------------------------------------ interactive

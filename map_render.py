@@ -40,6 +40,11 @@ ATTRIBUTION = {
     "osm": "© OpenStreetMap contributors",
 }
 
+# Terrarium-encoded elevation tiles (AWS Open Data, no key needed):
+# height in metres = (R * 256 + G + B / 256) - 32768
+DEM_TEMPLATE = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+DEM_MAX_ZOOM = 14
+
 TILE_SOURCES = {
     # hillshaded contours, names peaks and their heights - best for mountains
     "topo": ["https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
@@ -68,9 +73,15 @@ class MapConfig:
     # opacity: low while parked, high while travelling
     base_opacity: float = 0.60   # readable at rest ...
     move_opacity: float = 0.95   # ... and near-solid while travelling
+    move_grow: float = 2.2       # and briefly this many times its parked size
 
-    # 3d look
-    tilt: float = 0.30              # 0 = flat, ~0.5 = steeply raked
+    # 3d look: the terrain is shaded and raised from real elevation data, while
+    # the map itself stays flat and north-up (tilt defaults to off)
+    relief: float = 1.0             # 0 disables hillshading and the height bulge
+    relief_lift: float = 0.030      # peak displacement, as a fraction of the view
+    sun_azimuth: float = 315.0      # north-west light, the cartographic default
+    sun_altitude: float = 42.0
+    tilt: float = 0.0               # >0 rakes the whole plane back into perspective
     attribution: bool = True        # OSM-derived tiles need crediting on screen
     route_color: tuple[int, int, int, int] = (70, 70, 78, 190)
     done_color: tuple[int, int, int, int] = (235, 92, 48, 255)
@@ -81,11 +92,25 @@ class MapConfig:
 
 @dataclass
 class MapTrack:
-    """The map overlay for one clip: one still, or a short animation."""
+    """The map overlay for one clip: one still, or a short animation.
+
+    `scales` is parallel to `frames`: 1.0 is the parked size, larger values are
+    the brief swell while the view is travelling to a new place.
+    """
 
     frames: list[Path] = field(default_factory=list)
     fps: float = 12.0
     animated: bool = False
+    scales: list[float] = field(default_factory=list)
+
+    def scale_at(self, index: int) -> float:
+        if not self.scales:
+            return 1.0
+        return self.scales[min(index, len(self.scales) - 1)]
+
+    @property
+    def max_scale(self) -> float:
+        return max(self.scales) if self.scales else 1.0
 
     @property
     def first(self) -> Path | None:
@@ -211,24 +236,62 @@ def resolve_places(timeline: Timeline, cache_path: Path | None = None,
             log.warning("httpx unavailable - skipping place names")
     cache.save()
 
-    resolved = 0
+    detail: dict[int, str] = {}
     for entry in located:
         label = cache.get(f"{round(entry.gps.lat, precision)},{round(entry.gps.lon, precision)}@12")
         if label:
-            entry.place = label
-            resolved += 1
+            entry.extra["place_detail"] = label
+            detail[id(entry)] = label
 
     headers: dict[int, str] = {}
     for group, key in centroids.items():
         label = cache.get(key)
         if not label:  # fall back to whatever its clips agreed on
-            names = [e.place for e in groups[group] if e.place]
+            names = [detail.get(id(e)) for e in groups[group]]
+            names = [n for n in names if n]
             label = max(set(names), key=names.count) if names else None
         if label:
             headers[group] = label
-    log.info("place names: %d/%d clips, %d location header(s): %s",
-             resolved, len(located), len(headers), ", ".join(headers.values()) or "-")
+
+    # `place` is the canonical name for the whole cluster, so neighbouring
+    # clips do not flicker between "Matten bei Interlaken" and "Interlaken".
+    # The fine-grained name stays in extra for anyone who wants it.
+    resolved = 0
+    for entry in located:
+        entry.place = headers.get(entry.group) or detail.get(id(entry))
+        if entry.place:
+            resolved += 1
+    log.info("place names: %d/%d clips across %d location(s): %s",
+             resolved, len(located), len(headers),
+             ", ".join(dict.fromkeys(headers.values())) or "-")
     return headers
+
+
+def resolve_elevations(timeline: Timeline, cfg: MapConfig) -> int:
+    """Fill `entry.altitude` from the elevation tiles where EXIF had none.
+
+    Phones record GPS altitude inconsistently, and the terrain tiles are
+    already cached for the map, so the ground height is essentially free.
+    """
+    missing = [e for e in timeline.selected if e.has_gps() and e.altitude is None]
+    if not missing or cfg.relief <= 0:
+        return 0
+    fetcher = TileFetcher(cfg, [DEM_TEMPLATE], "terrarium")
+    filled = 0
+    try:
+        for entry in missing:
+            try:
+                metres = elevation_at(fetcher, entry.gps.lat, entry.gps.lon)
+            except Exception as exc:  # noqa: BLE001 - offline, bad tile
+                log.warning("elevation lookup failed for %s: %s", entry.name, exc)
+                break
+            if metres is not None:
+                entry.altitude = metres
+                filled += 1
+    finally:
+        fetcher.close()
+    log.info("filled elevation for %d clip(s) from terrain tiles", filled)
+    return filled
 
 
 # ----------------------------------------------------------- projection
@@ -255,10 +318,11 @@ def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
 class TileFetcher:
     """Fetches and caches map tiles; a failed tile becomes blank, never fatal."""
 
-    def __init__(self, cfg: MapConfig):
+    def __init__(self, cfg: MapConfig, templates: list[str] | None = None, name: str | None = None):
         self.cfg = cfg
-        self.templates = TILE_SOURCES.get(cfg.tiles, TILE_SOURCES["topo"])
-        self.cache_dir = Path(cfg.cache_dir or Path(cfg.out_dir).parent / "tile_cache") / cfg.tiles
+        self.templates = templates or TILE_SOURCES.get(cfg.tiles, TILE_SOURCES["topo"])
+        self.name = name or cfg.tiles
+        self.cache_dir = Path(cfg.cache_dir or Path(cfg.out_dir).parent / "tile_cache") / self.name
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.memory: dict[tuple[int, int, int], Image.Image] = {}
         self.blank = Image.new("RGB", (TILE_SIZE, TILE_SIZE), (238, 236, 231))
@@ -308,7 +372,7 @@ class TileFetcher:
         except Exception as exc:  # noqa: BLE001 - offline, 404, rate limited
             self.failures += 1
             if self.failures <= 2:
-                log.warning("tile %s/%s/%s unavailable (%s)", zoom, x, y, exc)
+                log.warning("%s tile %s/%s/%s unavailable (%s)", self.name, zoom, x, y, exc)
             tile = self.blank
         self.memory[key] = tile
         return tile
@@ -336,6 +400,102 @@ def render_viewport(fetcher: TileFetcher, center: tuple[float, float], zoom: int
     offset_x, offset_y = left - x0 * TILE_SIZE, top - y0 * TILE_SIZE
     view = canvas.crop((int(offset_x), int(offset_y), int(offset_x) + size, int(offset_y) + size))
     return view.convert("RGBA"), (left, top)
+
+
+# --------------------------------------------------------- 3d terrain
+
+def _decode_terrarium(tile: Image.Image) -> np.ndarray:
+    a = np.asarray(tile.convert("RGB"), dtype=np.float32)
+    return (a[..., 0] * 256.0 + a[..., 1] + a[..., 2] / 256.0) - 32768.0
+
+
+def render_dem(fetcher: TileFetcher, center: tuple[float, float], zoom: int,
+               size: int) -> np.ndarray | None:
+    """Elevation in metres for every pixel of the viewport, or None if the
+    elevation tiles are unreachable."""
+    zoom = min(zoom, DEM_MAX_ZOOM)
+    cx, cy = lon_to_x(center[1], zoom), lat_to_y(center[0], zoom)
+    left, top = cx - size / 2, cy - size / 2
+    x0, y0 = math.floor(left / TILE_SIZE), math.floor(top / TILE_SIZE)
+    x1, y1 = math.floor((left + size) / TILE_SIZE), math.floor((top + size) / TILE_SIZE)
+
+    rows = []
+    for ty in range(y0, y1 + 1):
+        row = [_decode_terrarium(fetcher.tile(zoom, tx, ty)) for tx in range(x0, x1 + 1)]
+        rows.append(np.hstack(row))
+    if not rows:
+        return None
+    grid = np.vstack(rows)
+    ox, oy = int(left - x0 * TILE_SIZE), int(top - y0 * TILE_SIZE)
+    patch = grid[oy:oy + size, ox:ox + size]
+    if patch.shape != (size, size):
+        return None
+    # a blank (failed) tile decodes to a constant -32768: treat as "no data"
+    return patch if patch.max() > -1000 else None
+
+
+def hillshade(dem: np.ndarray, cell_size_m: float, cfg: MapConfig) -> np.ndarray:
+    """Standard cartographic hillshade, 0 (shadow) to 1 (lit)."""
+    dy, dx = np.gradient(dem, max(cell_size_m, 1e-3))
+    z = max(cfg.relief, 0.0) * 1.6
+    slope = np.arctan(z * np.hypot(dx, dy))
+    # ESRI aspect convention for a north-up raster. Getting this backwards
+    # lights the terrain from the south-east, and every peak reads as a crater.
+    aspect = np.arctan2(dy, -dx)
+    azimuth = np.radians(360.0 - cfg.sun_azimuth + 90.0)
+    altitude = np.radians(cfg.sun_altitude)
+    shaded = (np.sin(altitude) * np.cos(slope)
+              + np.cos(altitude) * np.sin(slope) * np.cos(azimuth - aspect))
+    return np.clip(shaded, 0.0, 1.0)
+
+
+def apply_relief(view: Image.Image, dem: np.ndarray | None, zoom: int,
+                 center: tuple[float, float], cfg: MapConfig) -> Image.Image:
+    """Shade the map with the terrain, and push high ground upward.
+
+    Two effects combined: a hillshade multiply, which is what makes ridges and
+    couloirs read as shape, and a small vertical displacement so peaks stand
+    proud of the valleys. The displacement is drawn with a painter's order -
+    rows near the viewer are written last - so a summit correctly occludes the
+    ground behind it instead of bleeding through.
+    """
+    if dem is None or cfg.relief <= 0:
+        return view
+
+    rgba = np.asarray(view.convert("RGBA"), dtype=np.float32)
+    cell = 156543.03392 * math.cos(math.radians(center[0])) / (2 ** min(zoom, DEM_MAX_ZOOM))
+    shade = hillshade(dem, cell, cfg)
+
+    # Multiply with a floor, so shaded slopes stay readable rather than going
+    # black. The topo tiles already carry their own hillshade, so a full-range
+    # multiply here would double the contrast and crush the labels.
+    light = (0.72 + 0.50 * shade)[..., None]
+    rgba[..., :3] = np.clip(rgba[..., :3] * light, 0, 255)
+
+    lift = cfg.relief_lift * cfg.relief * view.size[1]
+    if lift >= 1.0:
+        low, high = float(np.percentile(dem, 2)), float(np.percentile(dem, 98))
+        if high - low > 30.0:                      # only where there is real relief
+            norm = np.clip((dem - low) / (high - low), 0.0, 1.0)
+            shift = (norm * lift).astype(np.int32)
+            height, width = shift.shape
+            ys, xs = np.indices((height, width))
+            target = ys - shift
+            keep = target >= 0
+            lifted = rgba.copy()                   # holes fall back to the flat map
+            lifted[target[keep], xs[keep]] = rgba[ys[keep], xs[keep]]
+            rgba = lifted
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA")
+
+
+def elevation_at(fetcher: TileFetcher, lat: float, lon: float, zoom: int = DEM_MAX_ZOOM) -> float | None:
+    """Ground elevation in metres at one coordinate, from the elevation tiles."""
+    zoom = min(zoom, DEM_MAX_ZOOM)
+    x, y = lon_to_x(lon, zoom), lat_to_y(lat, zoom)
+    tile = fetcher.tile(zoom, int(x // TILE_SIZE), int(y // TILE_SIZE))
+    dem = _decode_terrarium(tile)
+    value = float(dem[int(y % TILE_SIZE), int(x % TILE_SIZE)])
+    return round(value, 1) if -500.0 < value < 9000.0 else None
 
 
 # ------------------------------------------------------------ 3d tilt
@@ -456,21 +616,39 @@ def _draw_pin(view: Image.Image, at: tuple[float, float], cfg: MapConfig) -> Non
 
 def _frame(fetcher: TileFetcher, center: tuple[float, float], zoom: int,
            coords: list[tuple[float, float]], upto: int, opacity: float,
-           cfg: MapConfig) -> Image.Image:
-    """One finished map frame: tiles, route, tilt, pin, opacity, rounded corners."""
+           cfg: MapConfig, dem_fetcher: TileFetcher | None = None) -> Image.Image:
+    """One finished map frame: tiles, terrain relief, route, pin, opacity."""
     flat, origin = render_viewport(fetcher, center, zoom, cfg.size)
+    if dem_fetcher is not None and cfg.relief > 0:
+        flat = apply_relief(flat, render_dem(dem_fetcher, center, zoom, cfg.size),
+                            zoom, center, cfg)
     _draw_route(flat, origin, zoom, coords, upto, cfg)
 
     tilted, forward = apply_tilt(flat, cfg)
     here = (lon_to_x(coords[upto][1], zoom) - origin[0], lat_to_y(coords[upto][0], zoom) - origin[1])
     _draw_pin(tilted, _project(forward, here), cfg)
 
+    if cfg.tilt <= 0:
+        _round_corners(tilted, cfg)
     if cfg.attribution:
         _draw_attribution(tilted, cfg)
     if opacity < 1.0:
         alpha = tilted.getchannel("A").point(lambda v: int(v * opacity))
         tilted.putalpha(alpha)
     return tilted
+
+
+def _round_corners(view: Image.Image, cfg: MapConfig, radius_fraction: float = 0.035) -> None:
+    """Soften the card's corners, in place - an untilted map is a hard
+    rectangle sitting on top of the footage."""
+    size = view.size[0]
+    radius = max(6, int(size * radius_fraction))
+    mask = Image.new("L", view.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    alpha = np.minimum(np.array(view.getchannel("A")), np.array(mask))
+    view.putalpha(Image.fromarray(alpha.astype("uint8")))
+    ImageDraw.Draw(view).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius,
+                                           outline=(255, 255, 255, 150), width=2)
 
 
 def _draw_attribution(view: Image.Image, cfg: MapConfig) -> None:
@@ -524,6 +702,7 @@ def render_frames(timeline: Timeline, ordered_paths: list[str],
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     fetcher = TileFetcher(cfg)
+    dem_fetcher = TileFetcher(cfg, [DEM_TEMPLATE], "terrarium") if cfg.relief > 0 else None
     # a move worth animating: far enough that the view actually travels
     move_threshold_km = (cfg.size / 2) * (156543.03 * math.cos(math.radians(coords[0][0]))
                                           / (2 ** cfg.zoom)) / 1000.0 * 0.6
@@ -536,15 +715,16 @@ def render_frames(timeline: Timeline, ordered_paths: list[str],
             moving = cfg.animate and previous is not None and distance > move_threshold_km
 
             if not moving:
-                image = _frame(fetcher, center, cfg.zoom, coords, i, cfg.base_opacity, cfg)
+                image = _frame(fetcher, center, cfg.zoom, coords, i, cfg.base_opacity, cfg, dem_fetcher)
                 path = out_dir / f"map_{i:04d}.png"
                 image.save(path)
-                tracks.append(MapTrack([path], cfg.fps, False))
+                tracks.append(MapTrack([path], cfg.fps, False, [1.0]))
                 continue
 
             clip_dir = out_dir / f"map_{i:04d}"
             clip_dir.mkdir(exist_ok=True)
             frames: list[Path] = []
+            scales: list[float] = []
             n_move = max(2, int(cfg.move_seconds * cfg.fps))
             n_settle = max(1, int(cfg.settle_seconds * cfg.fps))
 
@@ -554,24 +734,30 @@ def render_frames(timeline: Timeline, ordered_paths: list[str],
                         previous[1] + (center[1] - previous[1]) * f)
                 # pull back over the middle of the flight, then come back in
                 zoom = cfg.zoom - cfg.move_zoom_out * math.sin(math.pi * f)
-                opacity = cfg.base_opacity + (cfg.move_opacity - cfg.base_opacity) * min(1.0, f * 4)
+                # opacity and size swell together as the view sets off
+                rise = min(1.0, f * 4)
+                opacity = cfg.base_opacity + (cfg.move_opacity - cfg.base_opacity) * rise
                 image = _frame(fetcher, here, int(round(zoom)), coords,
-                               i if f > 0.5 else max(0, i - 1), opacity, cfg)
+                               i if f > 0.5 else max(0, i - 1), opacity, cfg, dem_fetcher)
                 path = clip_dir / f"f{step:03d}.png"
                 image.save(path)
                 frames.append(path)
+                scales.append(1.0 + (cfg.move_grow - 1.0) * rise)
 
-            for step in range(n_settle):   # ease the opacity back down on arrival
+            for step in range(n_settle):   # shrink and fade back down on arrival
                 f = _ease((step + 1) / n_settle)
                 opacity = cfg.move_opacity + (cfg.base_opacity - cfg.move_opacity) * f
-                image = _frame(fetcher, center, cfg.zoom, coords, i, opacity, cfg)
+                image = _frame(fetcher, center, cfg.zoom, coords, i, opacity, cfg, dem_fetcher)
                 path = clip_dir / f"s{step:03d}.png"
                 image.save(path)
                 frames.append(path)
+                scales.append(cfg.move_grow + (1.0 - cfg.move_grow) * f)
 
-            tracks.append(MapTrack(frames, cfg.fps, True))
+            tracks.append(MapTrack(frames, cfg.fps, True, scales))
     finally:
         fetcher.close()
+        if dem_fetcher is not None:
+            dem_fetcher.close()
 
     animated = sum(1 for t in tracks if t.animated)
     log.info("rendered %d map views (%d animated moves, %d frames total) at zoom %d from %s tiles",

@@ -82,13 +82,42 @@ def _valid_gps(lat: Any, lon: Any) -> GPS | None:
     return GPS(round(lat_f, 7), round(lon_f, 7))
 
 
-_ISO6709 = re.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)")
+_ISO6709 = re.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?")
 
 
 def _parse_iso6709(value: str) -> GPS | None:
     """`+37.7749-122.4194+010.000/` - the QuickTime location string."""
     m = _ISO6709.match(str(value).strip())
     return _valid_gps(m.group(1), m.group(2)) if m else None
+
+
+def _iso6709_altitude(value: str) -> float | None:
+    """The third component of a QuickTime location string, in metres."""
+    m = _ISO6709.match(str(value).strip())
+    if not m or not m.group(3):
+        return None
+    return _valid_altitude(m.group(3))
+
+
+def _valid_altitude(value: Any, below_sea: Any = None) -> float | None:
+    """Metres above sea level, rejecting the nonsense some cameras write.
+
+    An exact 0 is treated as "not recorded", not as sea level: ffmpeg writes
+    `+0.000` into a QuickTime location string whenever it has no altitude, and
+    phones do the same. Phase 5 then fills the real ground height from the
+    terrain tiles, which is right for a genuine beach photo too.
+    """
+    try:
+        metres = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(metres) < 0.5:
+        return None
+    if str(below_sea).strip() in ("1", "True") and metres > 0:
+        metres = -metres          # GPSAltitudeRef 1 means below sea level
+    if not (-500.0 <= metres <= 9000.0):
+        return None
+    return round(metres, 1)
 
 
 def _signed_gps(value: Any, ref: Any) -> Any:
@@ -193,6 +222,18 @@ def _from_exiftool(tags: dict[str, Any]) -> dict[str, Any]:
             info["width"], info["height"] = int(w), int(h)
             break
 
+    altitude = _valid_altitude(tags.get("Composite:GPSAltitude"))
+    if altitude is None:
+        altitude = _valid_altitude(tags.get("EXIF:GPSAltitude"), tags.get("EXIF:GPSAltitudeRef"))
+    if altitude is None:
+        for tag in ("QuickTime:GPSCoordinates", "Composite:GPSPosition"):
+            if tags.get(tag):
+                altitude = _iso6709_altitude(tags[tag])
+                if altitude is not None:
+                    break
+    if altitude is not None:
+        info["altitude"] = altitude
+
     model = tags.get("EXIF:Model") or tags.get("QuickTime:Model") or tags.get("XMP:Model")
     if model:
         make = tags.get("EXIF:Make") or ""
@@ -277,6 +318,13 @@ def read_sidecar(path: Path) -> dict[str, Any]:
             info["gps"] = gps
             break
 
+    for candidate in (_dig(data, "exifInfo", "altitude"), _dig(data, "geoData", "altitude"),
+                      data.get("altitude"), data.get("GPSAltitude")):
+        altitude = _valid_altitude(candidate)
+        if altitude is not None:
+            info["altitude"] = altitude
+            break
+
     model = _dig(data, "exifInfo", "model") or data.get("model")
     if model:
         make = _dig(data, "exifInfo", "make") or ""
@@ -326,6 +374,9 @@ def ffprobe(path: Path) -> dict[str, Any]:
             gps = _parse_iso6709(tags[key])
             if gps:
                 info["gps"] = gps
+                altitude = _iso6709_altitude(tags[key])
+                if altitude is not None:
+                    info["altitude"] = altitude
                 break
     for key in ("creation_time", "com.apple.quicktime.creationdate", "date"):
         ts = _parse_timestamp(tags.get(key))
@@ -400,6 +451,9 @@ def _pillow_info(path: Path) -> dict[str, Any]:
                 )
                 if gps:
                     info["gps"] = gps
+                altitude = _valid_altitude(named.get("GPSAltitude"), named.get("GPSAltitudeRef"))
+                if altitude is not None:
+                    info["altitude"] = altitude
             return info
     except Exception as exc:  # noqa: BLE001 - unreadable image
         log.warning("Pillow could not read %s: %s", path.name, exc)
@@ -448,6 +502,7 @@ def build_entry(path: Path, exif_tags: dict[str, Any] | None = None) -> Timeline
         width=info.get("width"),
         height=info.get("height"),
         camera=info.get("camera"),
+        altitude=info.get("altitude"),
         timestamp_source=info.get("timestamp_source"),
     )
 
@@ -491,6 +546,7 @@ def ingest(input_dir: str | Path, previous: Timeline | None = None, progress_cb=
                 entry.blur_score = old.blur_score
                 entry.brightness = old.brightness
                 entry.selected = old.selected
+                entry.place = old.place
                 entry.drop_reason = old.drop_reason
                 entry.group = old.group
                 entry.extra = old.extra

@@ -16,7 +16,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
-from mediautil import extract_keyframes, has_audio_stream, load_pil
+from mediautil import extract_keyframes, has_audio_stream, load_pil, measure_audio
 from models import Timeline, TimelineEntry
 
 log = logging.getLogger(__name__)
@@ -332,7 +332,12 @@ def transcribe_entries(entries: list[TimelineEntry], cfg: UnderstandConfig,
             try:
                 if not has_audio_stream(e.filepath):
                     e.transcript = ""
+                    e.extra.pop("audio_mean_db", None)
                 else:
+                    levels = measure_audio(e.filepath)   # cached for Phase 6's mixing
+                    if levels:
+                        e.extra["audio_mean_db"] = round(levels["mean_db"], 2)
+                        e.extra["audio_max_db"] = round(levels["max_db"], 2)
                     result = model.transcribe(
                         e.filepath,
                         fp16=(str(next(model.parameters()).device).startswith("cuda")),

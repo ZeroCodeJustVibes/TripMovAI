@@ -68,6 +68,7 @@ class TimelineEntry:
 
     # Phase 5 (reverse geocoded from gps, cached so it is looked up once)
     place: str | None = None
+    altitude: float | None = None   # metres above sea level, if the camera knew
 
     # Phase 1 extras
     width: int | None = None

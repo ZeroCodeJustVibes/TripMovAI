@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import assemble
 import map_render
+import mediautil
 import narrative
 import selection
 from ingest import _parse_iso6709, _parse_timestamp, _valid_gps, _sort_key
@@ -291,7 +292,8 @@ class TestAssemble:
         img = assemble.caption_overlay("A short caption", (800, 600))
         assert img.size == (800, 600)
         assert img.getpixel((400, 30))[3] == 0          # nothing at the top
-        assert any(img.getpixel((x, 500))[3] > 0 for x in range(40, 400))
+        assert any(img.getpixel((x, y))[3] > 0
+                   for x in range(40, 400) for y in range(430, 590))
 
     def test_no_caption_no_overlay(self):
         assert assemble.caption_overlay("", (800, 600)) is None
@@ -322,17 +324,18 @@ class TestTimeline:
 
 
 class TestCaptionBand:
-    def test_overlay_band_stops_left_of_the_map(self):
-        cfg = assemble.AssembleConfig(map_mode="overlay", map_width_fraction=0.28)
-        x0, x1 = assemble.caption_band((1000, 600), cfg, has_map=True)
-        size, position = assemble.map_geometry((1000, 600), cfg)
-        assert x0 == 0 and x1 <= position[0]      # caption never runs under the map
+    def test_overlay_band_is_the_full_width(self):
+        # the map moved to the top-left corner, so the caption has the run of
+        # the bottom of the frame again
+        cfg = assemble.AssembleConfig(map_mode="overlay")
+        assert assemble.caption_band((1000, 600), cfg, has_map=True) == (0, 1000)
 
-    def test_map_sits_bottom_right_in_overlay_mode(self):
-        cfg = assemble.AssembleConfig(map_mode="overlay", map_width_fraction=0.28)
+    def test_map_sits_top_left_in_overlay_mode(self):
+        cfg = assemble.AssembleConfig(map_mode="overlay")
         size, (x, y) = assemble.map_geometry((1920, 1080), cfg)
-        assert x + size < 1920 and x > 1920 * 0.6     # right-hand side
-        assert y + size < 1080 and y > 1080 * 0.4     # lower half
+        assert x < 1920 * 0.05 and y < 1080 * 0.05           # tucked into the corner
+        assert size == pytest.approx(1920 * 0.14, abs=2)     # half the previous size
+        assert size + y < 1080 * 0.35                        # nowhere near the caption
 
     def test_side_band_stops_left_of_the_panel(self):
         cfg = assemble.AssembleConfig(map_mode="side", side_panel_fraction=0.30)
@@ -349,12 +352,6 @@ class TestCaptionBand:
         bottom_right = any(pixels[x, y][3] > 0 for x in range(700, 990) for y in range(480, 580))
         top = any(pixels[x, y][3] > 0 for x in range(0, 1000) for y in range(0, 100))
         assert bottom_left and not bottom_right and not top
-
-    def test_header_sits_top_left(self):
-        img = assemble.caption_overlay("", (1000, 600), header="Interlaken")
-        pixels = img.load()
-        assert any(pixels[x, y][3] > 0 for x in range(20, 400) for y in range(20, 140))
-        assert not any(pixels[x, y][3] > 0 for x in range(0, 1000) for y in range(400, 600))
 
 
 class _RejectJsonModeHandler(_MockHandler):
@@ -386,7 +383,8 @@ def test_retries_without_json_mode(three_clip_timeline):
             base_url=f"http://127.0.0.1:{server.server_port}", api_key="k"))
     finally:
         server.shutdown()
-    assert [b.get("response_format") is not None for b in _MockHandler.received] == [True, False]
+    sent = [b.get("response_format") is not None for b in _MockHandler.received]
+    assert sent[:2] == [True, False]      # json mode rejected, retried without it
     assert plan.mood == "plain mode"
 
 
@@ -509,51 +507,243 @@ class TestVideoDedup:
         assert sorted(e.name for e in kept) == ["shot.jpg", "shot.mp4"]
 
 
-class TestPlaceHeaders:
-    """A week in one valley yields many GPS clusters but one place name."""
+class TestNoTopHeader:
+    """The title at the top was removed: the location line names the place."""
 
-    def _run(self, groups, names, tmp_path, music):
-        """Return the header drawn for each clip, by stubbing the overlay call."""
-        import assemble as A
+    def test_overlay_draws_nothing_in_the_top_strip(self):
+        img = assemble.caption_overlay("Nobody admits being lost", (1000, 600),
+                                       location="Interlaken · 568 m")
+        pixels = img.load()
+        assert not any(pixels[x, y][3] > 0
+                       for x in range(0, 1000) for y in range(0, 220))
 
+    def test_caption_overlay_takes_no_header(self):
+        import inspect
+        assert "header" not in inspect.signature(assemble.caption_overlay).parameters
+
+    def test_assemble_takes_no_place_headers(self):
+        import inspect
+        assert "place_headers" not in inspect.signature(assemble.assemble).parameters
+
+
+class TestAudioNormalisation:
+    """Phone clips arrive between -25 and -64 dBFS; the mix has to even that out."""
+
+    cfg = assemble.AssembleConfig()
+
+    def db(self, volume: float) -> float:
+        import math
+        return 20 * math.log10(max(volume, 1e-9))
+
+    def test_quiet_clip_is_lifted(self):
+        quiet = {"mean_db": -38.0, "max_db": -18.0}
+        volume = assemble.normalized_volume(quiet, 1.0, -20.0, self.cfg)
+        assert self.db(volume) == pytest.approx(17.0, abs=0.5)
+
+    def test_peaks_are_never_clipped(self):
+        # quiet on average but with peaks near full scale: lift only to headroom
+        spiky = {"mean_db": -40.0, "max_db": -0.5}
+        volume = assemble.normalized_volume(spiky, 1.0, -20.0, self.cfg)
+        assert self.db(volume) + spiky["max_db"] <= -self.cfg.headroom_db + 1e-6
+
+    def test_silence_is_not_amplified(self):
+        silent = {"mean_db": -63.6, "max_db": -39.8}
+        assert assemble.normalized_volume(silent, 0.4, -20.0, self.cfg) == 0.4
+
+    def test_gain_is_capped(self):
+        very_quiet = {"mean_db": -70.0, "max_db": -60.0}
+        cfg = assemble.AssembleConfig(silence_floor_db=-99.0, max_gain_db=18.0)
+        assert self.db(assemble.normalized_volume(very_quiet, 1.0, -20.0, cfg)) <= 18.0 + 1e-6
+
+    def test_unmeasured_and_disabled_fall_back_to_the_role_volume(self):
+        assert assemble.normalized_volume(None, 0.4, -20.0, self.cfg) == 0.4
+        off = assemble.AssembleConfig(normalize_audio=False)
+        assert assemble.normalized_volume({"mean_db": -50.0, "max_db": -30.0}, 0.4, -20.0, off) == 0.4
+
+    def test_measure_audio_reads_a_real_file(self, tiny_music):
+        levels = mediautil.measure_audio(tiny_music)
+        assert levels and -60.0 < levels["mean_db"] < 0.0
+
+
+class TestLocationLabel:
+    def test_name_with_elevation(self):
+        e = entry("a.jpg", 0, 47.27, 11.51)
+        e.place, e.altitude = "Kitzbuehel", 1878.2
+        assert assemble.location_label(e) == "Kitzbuehel · 1,878 m"
+
+    def test_coordinates_when_unnamed(self):
+        e = entry("a.jpg", 0, 47.2712, 11.5134)
+        assert assemble.location_label(e) == "47.2712, 11.5134"
+
+    def test_nothing_without_gps(self):
+        assert assemble.location_label(entry("a.jpg")) is None
+
+    def test_label_is_drawn_below_the_caption(self):
+        img = assemble.caption_overlay("Nobody admits being lost", (1000, 600),
+                                       location="Kitzbuehel · 1,878 m")
+        pixels = img.load()
+        rows = [y for y in range(300, 600)
+                if any(pixels[x, y][3] > 0 for x in range(20, 500))]
+        assert rows, "nothing drawn"
+        # the location line is the lowest ink on the frame
+        assert max(rows) > 540
+
+
+class TestTerrainRelief:
+    def _dem(self, peak: float = 3000.0):
+        import numpy as np
+        ys, xs = np.mgrid[0:64, 0:64]
+        return (peak * np.exp(-((xs - 32) ** 2 + (ys - 32) ** 2) / 300.0)).astype("float32")
+
+    def test_hillshade_lights_the_sun_facing_slope(self):
+        cfg = map_render.MapConfig(sun_azimuth=315.0, sun_altitude=45.0)
+        shade = map_render.hillshade(self._dem(), 30.0, cfg)
+        assert 0.0 <= shade.min() and shade.max() <= 1.0
+        # north-west light: the NW flank is brighter than the SE flank
+        assert shade[20, 20] > shade[44, 44]
+
+    def test_relief_changes_the_image_and_flat_terrain_does_not(self):
+        import numpy as np
         from PIL import Image
+        base = Image.fromarray(np.full((64, 64, 4), 200, dtype="uint8"), "RGBA")
+        cfg = map_render.MapConfig(size=64, relief=1.0)
+        shaded = map_render.apply_relief(base, self._dem(), 12, (47.0, 11.0), cfg)
+        assert np.asarray(shaded).std() > 1.0            # terrain now has shape
 
-        drawn = []
-        entries = []
-        for i, group in enumerate(groups):
-            path = tmp_path / f"p{i}.jpg"
-            Image.new("RGB", (64, 48), (40 + i * 20, 80, 120)).save(path)
-            e = entry(f"p{i}.jpg", i)
-            e.filepath = str(path)
-            e.group, e.selected = group, True
-            e.width, e.height = 64, 48
-            entries.append(e)
-        tl = Timeline(entries)
-        plan = NarrativePlan(ordered_clips=[e.filepath for e in entries])
+        flat = np.zeros((64, 64), dtype="float32")
+        unshaded = map_render.apply_relief(base, flat, 12, (47.0, 11.0), cfg)
+        assert np.asarray(unshaded)[..., :3].std() < 1.0  # nothing to shade
 
-        original = A.caption_overlay
+    def test_relief_disabled_returns_the_original(self):
+        from PIL import Image
+        base = Image.new("RGBA", (64, 64), (200, 200, 200, 255))
+        cfg = map_render.MapConfig(size=64, relief=0.0)
+        assert map_render.apply_relief(base, self._dem(), 12, (47.0, 11.0), cfg) is base
+        assert map_render.apply_relief(base, None, 12, (47.0, 11.0),
+                                       map_render.MapConfig(size=64)) is base
 
-        def spy(text, frame_size, header=None, text_band=None):
-            drawn.append(header)
-            return None
+    def test_terrarium_decoding(self):
+        import numpy as np
+        from PIL import Image
+        # terrarium: height = R*256 + G + B/256 - 32768
+        tile = Image.fromarray(np.array([[[128, 100, 0]]], dtype="uint8"), "RGB")
+        assert map_render._decode_terrarium(tile)[0, 0] == pytest.approx(128 * 256 + 100 - 32768)
 
-        A.caption_overlay = spy
-        try:
-            A.assemble(tl, plan, music, str(tmp_path / "x.mp4"), None,
-                       A.AssembleConfig(photo_duration=0.5, fps=4, preset="ultrafast",
-                                        map_mode="none", resolution=(64, 48)),
-                       place_headers=names)
-        finally:
-            A.caption_overlay = original
-        return drawn
 
-    def test_header_only_on_a_new_name(self, tmp_path, tiny_music):
-        # five clusters, but only two actual places
-        drawn = self._run([0, 1, 2, 3, 4], {0: "Kitzbuehel", 1: "Kitzbuehel",
-                                            2: "Kitzbuehel", 3: "Innsbruck", 4: "Innsbruck"},
-                          tmp_path, tiny_music)
-        assert drawn == ["Kitzbuehel", "Innsbruck"]
+class TestLabelAmount:
+    def test_fraction_parsing(self):
+        import main
+        assert main.parse_fraction("25%", "--amount-labels") == pytest.approx(0.25)
+        assert main.parse_fraction("0.25", "--amount-labels") == pytest.approx(0.25)
+        assert main.parse_fraction("40", "--amount-labels") == pytest.approx(0.40)
 
-    def test_unnamed_clusters_do_not_clear_the_header(self, tmp_path, tiny_music):
-        drawn = self._run([0, None, 0, 1], {0: "Zermatt", 1: "Interlaken"}, tmp_path, tiny_music)
-        assert drawn == ["Zermatt", "Interlaken"]
+    def test_rejects_nonsense(self):
+        import main
+        with pytest.raises(SystemExit):
+            main.parse_fraction("loads", "--amount-labels")
+        with pytest.raises(SystemExit):
+            main.parse_fraction("300%", "--amount-labels")
+
+    def test_target_reaches_the_prompt(self, mock_openrouter, three_clip_timeline):
+        url, handler = mock_openrouter
+        handler.replies.append(json.dumps({"ordered_clips": ["c0", "c1", "c2"],
+                                           "captions": {"c0": "One", "c1": "Two", "c2": "Three"}}))
+        narrative.plan_narrative(three_clip_timeline, narrative.NarrativeConfig(
+            base_url=url, api_key="k", label_fraction=1.0))
+        system = handler.received[0]["messages"][0]["content"]
+        assert "EXACTLY 3 of the 3 clips" in system
+
+    def test_shortfall_triggers_one_top_up(self, mock_openrouter, three_clip_timeline):
+        url, handler = mock_openrouter
+        handler.replies.append(json.dumps({"ordered_clips": ["c0", "c1", "c2"],
+                                           "captions": {"c0": "Only one"}}))
+        handler.replies.append(json.dumps({"captions": {"c1": "Second thoughts",
+                                                        "c2": "Third, reluctantly"}}))
+        plan = narrative.plan_narrative(three_clip_timeline, narrative.NarrativeConfig(
+            base_url=url, api_key="k", label_fraction=1.0))
+        assert len(handler.received) == 2
+        assert len(plan.captions) == 3
+        assert "uncaptioned" in handler.received[1]["messages"][1]["content"]
+
+    def test_no_top_up_when_target_is_met(self, mock_openrouter, three_clip_timeline):
+        url, handler = mock_openrouter
+        handler.replies.append(json.dumps({"ordered_clips": ["c0", "c1", "c2"],
+                                           "captions": {"c0": "Enough", "c1": "Plenty"}}))
+        plan = narrative.plan_narrative(three_clip_timeline, narrative.NarrativeConfig(
+            base_url=url, api_key="k", label_fraction=0.34))
+        assert len(handler.received) == 1 and len(plan.captions) == 2
+
+
+class TestMapSwell:
+    """The map is small while parked and swells briefly during a move."""
+
+    def _track(self, tmp_path, scales):
+        from PIL import Image
+        import map_render
+        frames = []
+        for i, _ in enumerate(scales):
+            path = tmp_path / f"f{i}.png"
+            Image.new("RGBA", (600, 600), (10, 120, 60, 255)).save(path)
+            frames.append(path)
+        return map_render.MapTrack(frames, 12.0, True, list(scales))
+
+    def test_scale_schedule_rises_and_returns(self):
+        import map_render
+        track = map_render.MapTrack([], 12.0, True, [1.0, 1.6, 2.2, 2.2, 1.4, 1.0])
+        assert track.max_scale == 2.2
+        assert track.scale_at(0) == 1.0
+        assert track.scale_at(2) == 2.2
+        assert track.scale_at(99) == 1.0           # holds the parked size at the end
+
+    def test_still_track_never_scales(self, tmp_path):
+        import map_render
+        still = map_render.MapTrack([tmp_path / "x.png"], 12.0, False, [1.0])
+        assert still.max_scale == 1.0 and still.scale_at(5) == 1.0
+
+    def test_canvas_fits_the_largest_frame_and_holds_position(self, tmp_path):
+        cfg = assemble.AssembleConfig(map_mode="overlay")
+        frame_size = (1920, 1080)
+        size, position = assemble.map_geometry(frame_size, cfg)
+        track = self._track(tmp_path, [1.0, 1.6, 2.2, 1.0])
+        clip = assemble.map_animation_clip(track, frame_size, cfg, 3.0)
+        assert clip is not None
+        canvas = clip.get_frame(0).shape[0]
+        assert canvas == pytest.approx(size * 2.2, abs=2)   # room for the swell
+        assert tuple(clip.pos(0)) == position               # anchored in the corner
+
+    def test_map_grows_then_shrinks_over_time(self, tmp_path):
+        import numpy as np
+        cfg = assemble.AssembleConfig(map_mode="overlay")
+        track = self._track(tmp_path, [1.0, 1.6, 2.2, 1.0])
+        clip = assemble.map_animation_clip(track, (1920, 1080), cfg, 4.0)
+        mask = clip.mask
+
+        def covered(t):
+            return float(np.asarray(mask.get_frame(t)).sum())
+
+        parked, mid, grown = covered(0.0), covered(1.0 / 12), covered(2.0 / 12)
+        assert parked < mid < grown                 # swells while travelling
+        assert covered(3.0 / 12) == pytest.approx(parked, rel=0.02)   # and returns
+
+
+class TestAltitude:
+    def test_real_values_pass_through(self):
+        from ingest import _valid_altitude
+        assert _valid_altitude("1878.2") == 1878.2
+        assert _valid_altitude(586) == 586.0
+
+    def test_placeholder_zero_is_not_sea_level(self):
+        # ffmpeg writes "+0.000" into a QuickTime location when it has none
+        from ingest import _iso6709_altitude, _valid_altitude
+        assert _valid_altitude(0) is None
+        assert _iso6709_altitude("+46.0207+7.7491+0.000/") is None
+        assert _iso6709_altitude("+47.2712+011.5134+586.000/") == 586.0
+
+    def test_below_sea_level_reference(self):
+        from ingest import _valid_altitude
+        assert _valid_altitude(12.0, below_sea="1") == -12.0
+
+    def test_out_of_range_is_rejected(self):
+        from ingest import _valid_altitude
+        assert _valid_altitude(99999) is None
+        assert _valid_altitude("not a number") is None

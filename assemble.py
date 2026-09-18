@@ -43,7 +43,8 @@ class AssembleConfig:
     crossfade: float = 0.5
     map_mode: str = "overlay"          # overlay | side | none
     map_opacity: float = 0.35
-    map_width_fraction: float = 0.28   # of frame width, overlay mode
+    map_width_fraction: float = 0.14   # of frame width, overlay mode (parked size)
+    map_margin_fraction: float = 0.022
     side_panel_fraction: float = 0.30  # of frame width, side mode
     resolution: tuple[int, int] | None = None
     fps: int = 30
@@ -56,7 +57,15 @@ class AssembleConfig:
     duck_volume: float = 0.15
     ambient_volume: float = 0.40
     duck_fade: float = 0.4
-    show_chapters: bool = True
+
+    # loudness matching: phone clips arrive anywhere from -25 to -64 dBFS
+    normalize_audio: bool = True
+    clip_target_db: float = -18.0     # where a clip's own audio should sit
+    music_target_db: float = -20.0    # the bed, a couple of dB under the clips
+    max_gain_db: float = 18.0         # never amplify hiss into a roar
+    silence_floor_db: float = -45.0   # below this a clip is silence, not quiet
+    headroom_db: float = 1.0
+    show_location: bool = True
     ffmpeg_params: list[str] = field(default_factory=lambda: ["-movflags", "+faststart"])
 
 
@@ -113,15 +122,48 @@ def _wrap(text: str, font: ImageFont.FreeTypeFont, max_width: int, draw: ImageDr
     return lines[:2]
 
 
-def caption_overlay(text: str, frame_size: tuple[int, int], header: str | None = None,
-                    text_band: tuple[int, int] | None = None) -> Image.Image | None:
-    """Transparent full-frame overlay: caption bottom-left, header top-left.
+def location_label(entry: TimelineEntry) -> str | None:
+    """"Kitzbuehel · 1,878 m", falling back to raw coordinates without a name."""
+    if entry.place:
+        label = entry.place
+    elif entry.has_gps():
+        label = f"{entry.gps.lat:.4f}, {entry.gps.lon:.4f}"
+    else:
+        return None
+    if entry.altitude is not None:
+        label = f"{label} · {entry.altitude:,.0f} m"
+    return label
 
-    `text_band` is the horizontal span the text may use, so neither line runs
-    under the map - which sits bottom-right in overlay mode and fills the right
-    panel in side mode.
+
+def _draw_pin_icon(draw: ImageDraw.ImageDraw, x: float, y: float, size: float,
+                   color=(235, 92, 48, 245)) -> float:
+    """A small map pin, drawn rather than typed - the bundled fonts have no
+    emoji glyphs, so a literal marker character would render as a blank box.
+    Returns the width it used."""
+    r = size * 0.34
+    cx, cy = x + r, y + r
+    draw.ellipse([cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1], fill=(0, 0, 0, 120))
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+    draw.polygon([(cx - r * 0.62, cy + r * 0.55), (cx + r * 0.62, cy + r * 0.55),
+                  (cx, cy + r * 1.85)], fill=color)
+    draw.ellipse([cx - r * 0.34, cy - r * 0.34, cx + r * 0.34, cy + r * 0.34],
+                 fill=(255, 255, 255, 235))
+    return r * 2 + size * 0.22
+
+
+def caption_overlay(text: str, frame_size: tuple[int, int],
+                    text_band: tuple[int, int] | None = None,
+                    location: str | None = None) -> Image.Image | None:
+    """Transparent full-frame overlay: the caption bottom-left, with the
+    location line beneath it.
+
+    There is deliberately no title at the top - the place is already named in
+    the location line, and a second label competed with the footage.
+
+    `text_band` is the horizontal span the text may use, so nothing runs under
+    a side-mode map panel.
     """
-    if not text and not header:
+    if not text and not location:
         return None
     width, height = frame_size
     overlay = Image.new("RGBA", frame_size, (0, 0, 0, 0))
@@ -129,6 +171,18 @@ def caption_overlay(text: str, frame_size: tuple[int, int], header: str | None =
     x0, x1 = text_band or (0, width)
     band = max(160, x1 - x0)
     left = x0 + int(width * 0.045)
+    bottom = height - int(height * 0.055)
+
+    if location:
+        loc_font = _load_font(max(13, int(height * 0.030)))
+        loc_h = loc_font.getbbox("Ag")[3] - loc_font.getbbox("Ag")[1]
+        icon = max(12.0, height * 0.034)
+        top = int(bottom - max(loc_h, icon))
+        used = _draw_pin_icon(draw, left, top, icon)
+        # a shadow instead of a bar: this line should sit quietly under the joke
+        draw.text((left + used + 1, top + 1), location, font=loc_font, fill=(0, 0, 0, 165))
+        draw.text((left + used, top), location, font=loc_font, fill=(255, 255, 255, 235))
+        bottom = top - int(height * 0.016)
 
     if text:
         font = _load_font(max(16, int(height * 0.042)))   # relative to frame height
@@ -138,7 +192,7 @@ def caption_overlay(text: str, frame_size: tuple[int, int], header: str | None =
         text_w = max(int(draw.textlength(line, font=font)) for line in lines)
         bar_w = min(text_w + pad_x * 2, band - int(width * 0.05))
         bar_h = line_h * len(lines) + pad_y * 2
-        bar_top = height - bar_h - int(height * 0.075)
+        bar_top = int(bottom - bar_h)
 
         bar = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
         ImageDraw.Draw(bar).rounded_rectangle([0, 0, bar_w - 1, bar_h - 1],
@@ -149,26 +203,18 @@ def caption_overlay(text: str, frame_size: tuple[int, int], header: str | None =
         for line in lines:
             draw.text((left + pad_x, y), line, font=font, fill=(255, 255, 255, 242))
             y += line_h
-
-    if header:
-        hfont = _load_font(max(18, int(height * 0.052)))
-        y = int(height * 0.065)
-        draw.text((left + 2, y + 2), header, font=hfont, fill=(0, 0, 0, 150))
-        draw.text((left, y), header, font=hfont, fill=(255, 255, 255, 238))
-        box = draw.textbbox((left, y), header, font=hfont)
-        draw.line([left, box[3] + 9, box[2], box[3] + 9],
-                  fill=(235, 92, 48, 235), width=max(2, int(height * 0.004)))
     return overlay
 
 
 # -------------------------------------------------------------- map frame
 
 def map_geometry(frame_size: tuple[int, int], cfg: AssembleConfig) -> tuple[int, tuple[int, int]]:
-    """(display size, top-left position) for the map in the current mode.
+    """(parked display size, top-left position) for the map in the current mode.
 
-    Overlay mode puts it bottom-**right**: the caption now owns the bottom-left
-    corner. Opacity is already baked into the rendered PNG by Phase 5, which
-    varies it while the view is travelling.
+    Overlay mode keeps it small in the **top-left** corner, out of the way of
+    both the footage and the caption block at the bottom. It grows from that
+    anchor while the view travels, so the corner it occupies never moves.
+    Opacity is already baked into the PNG by Phase 5.
     """
     width, height = frame_size
     if cfg.map_mode == "side":
@@ -176,8 +222,8 @@ def map_geometry(frame_size: tuple[int, int], cfg: AssembleConfig) -> tuple[int,
         size = min(panel - int(width * 0.03), height - int(height * 0.06))
         return size, (width - panel + (panel - size) // 2, (height - size) // 2)
     size = int(width * cfg.map_width_fraction)
-    margin = int(width * 0.022)
-    return size, (width - size - margin, height - size - margin)
+    margin = int(width * cfg.map_margin_fraction)
+    return size, (margin, margin)
 
 
 def map_overlay(map_path: Path, frame_size: tuple[int, int], cfg: AssembleConfig) -> Image.Image | None:
@@ -194,7 +240,12 @@ def map_overlay(map_path: Path, frame_size: tuple[int, int], cfg: AssembleConfig
 
 
 def map_animation_clip(track, frame_size: tuple[int, int], cfg: AssembleConfig, duration: float):
-    """A moving map as a small positioned clip, holding its last frame.
+    """A moving, growing map as a positioned clip, holding its last frame.
+
+    The clip's canvas is fixed at the largest size the map reaches, and each
+    frame is drawn into it scaled and anchored top-left. MoviePy needs every
+    frame of a clip to be the same shape, so the swell has to happen *inside*
+    a constant canvas rather than by resizing the clip itself.
 
     Only clips where the trip changes location get one; everywhere else the map
     is a still that gets flattened into the photo, which is far cheaper.
@@ -202,15 +253,21 @@ def map_animation_clip(track, frame_size: tuple[int, int], cfg: AssembleConfig, 
     from moviepy import VideoClip
 
     size, position = map_geometry(frame_size, cfg)
+    canvas = max(size, int(size * track.max_scale))
+    canvas = min(canvas, min(frame_size) - 2)     # never larger than the frame
+
     rgb, alpha = [], []
-    for path in track.frames:
+    for index, path in enumerate(track.frames):
         try:
-            frame = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+            frame = Image.open(path).convert("RGBA")
         except Exception as exc:  # noqa: BLE001
             log.warning("cannot read map frame %s: %s", path, exc)
             continue
-        rgb.append(np.array(frame.convert("RGB")))
-        alpha.append(np.array(frame.getchannel("A"), dtype=np.float32) / 255.0)
+        drawn = max(8, min(canvas, int(round(size * track.scale_at(index)))))
+        slot = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+        slot.alpha_composite(frame.resize((drawn, drawn), Image.LANCZOS), (0, 0))
+        rgb.append(np.array(slot.convert("RGB")))
+        alpha.append(np.array(slot.getchannel("A"), dtype=np.float32) / 255.0)
     if not rgb:
         return None
 
@@ -233,8 +290,7 @@ def caption_band(frame_size: tuple[int, int], cfg: AssembleConfig, has_map: bool
         return (0, width)
     if cfg.map_mode == "side":
         return (0, int(width * (1 - cfg.side_panel_fraction)))
-    size, position = map_geometry(frame_size, cfg)
-    return (0, position[0] - int(width * 0.02))
+    return (0, width)   # overlay mode keeps the map up in the top-left corner
 
 
 def _video_area(frame_size: tuple[int, int], cfg: AssembleConfig) -> tuple[int, int, int, int]:
@@ -316,6 +372,40 @@ def clip_duration(entry: TimelineEntry, cfg: AssembleConfig) -> float:
 
 # ------------------------------------------------------------------ audio
 
+def audio_levels(entry: TimelineEntry) -> dict[str, float] | None:
+    """Cached loudness for a clip, measured on demand if Phase 3 was skipped."""
+    mean = entry.extra.get("audio_mean_db")
+    if mean is not None:
+        return {"mean_db": float(mean), "max_db": float(entry.extra.get("audio_max_db", 0.0))}
+    from mediautil import measure_audio
+
+    levels = measure_audio(entry.filepath)
+    if levels:
+        entry.extra["audio_mean_db"] = round(levels["mean_db"], 2)
+        entry.extra["audio_max_db"] = round(levels["max_db"], 2)
+    return levels
+
+
+def normalized_volume(levels: dict[str, float] | None, role_volume: float,
+                      target_db: float, cfg: AssembleConfig) -> float:
+    """Volume factor that brings a clip to `target_db`, then applies its role.
+
+    The peak guard is applied to the *combined* figure, so a clip that is only
+    quiet on average but has loud transients is lifted as far as its peaks
+    allow and no further - no clipping, no limiter needed. Clips under the
+    silence floor are left alone: boosting them 40 dB only amplifies hiss.
+    """
+    if not cfg.normalize_audio or not levels:
+        return role_volume
+    if levels["mean_db"] < cfg.silence_floor_db:
+        return role_volume
+
+    role_db = 20 * math.log10(max(role_volume, 1e-6))
+    gain_db = max(min(target_db - levels["mean_db"], cfg.max_gain_db), -cfg.max_gain_db)
+    total_db = min(gain_db + role_db, -cfg.headroom_db - levels["max_db"])
+    return float(10 ** (total_db / 20))
+
+
 def _gain_envelope(windows: list[tuple[float, float]], level: float, fade: float, total: float):
     """A time -> gain function: 1.0 normally, `level` inside each window."""
     def gain(t):
@@ -334,8 +424,10 @@ def _gain_envelope(windows: list[tuple[float, float]], level: float, fade: float
 
 def build_audio(music_path: str, total: float, duck_windows: list[tuple[float, float]],
                 clip_audio: list, cfg: AssembleConfig):
-    """Music bed (looped, ducked) mixed with the video clips' own audio."""
+    """Music bed (looped, normalised, ducked) mixed with the clips' own audio."""
     from moviepy import AudioFileClip, CompositeAudioClip, afx
+
+    from mediautil import measure_audio
 
     tracks = []
     try:
@@ -343,7 +435,12 @@ def build_audio(music_path: str, total: float, duck_windows: list[tuple[float, f
         if music.duration < total:
             music = music.with_effects([afx.AudioLoop(duration=total)])
         music = music.subclipped(0, min(total, music.duration))
-        effects = [afx.MultiplyVolume(cfg.music_volume), afx.AudioFadeIn(1.0),
+        music_volume = cfg.music_volume
+        if cfg.normalize_audio:
+            music_volume = normalized_volume(measure_audio(music_path), cfg.music_volume,
+                                             cfg.music_target_db, cfg)
+            log.info("music level %+.1f dB", 20 * math.log10(max(music_volume, 1e-6)))
+        effects = [afx.MultiplyVolume(music_volume), afx.AudioFadeIn(1.0),
                    afx.AudioFadeOut(min(2.5, total / 4))]
         music = music.with_effects(effects)
         if duck_windows:
@@ -371,8 +468,7 @@ def build_audio(music_path: str, total: float, duck_windows: list[tuple[float, f
 
 def assemble(timeline: Timeline, plan: NarrativePlan, music_path: str, output_path: str,
              map_tracks: Sequence | None, cfg: AssembleConfig,
-             progress_cb: Callable | None = None,
-             place_headers: dict[int, str] | None = None) -> str:
+             progress_cb: Callable | None = None) -> str:
     """Render the whole video and write it to `output_path`."""
     from moviepy import CompositeVideoClip, VideoFileClip, afx, vfx
 
@@ -390,10 +486,9 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path: str, output_pa
     frame_size = cfg.resolution or target_resolution(timeline, [e for _, _, e in entries])
     log.info("assembling %d clips at %dx%d", len(entries), *frame_size)
 
-    chapters = {c.at_clip: c.title for c in plan.chapter_markers} if cfg.show_chapters else {}
-    place_headers = place_headers or {}
+    # plan.chapter_markers is kept in narrative.json for reference but is no
+    # longer drawn: the location line already names the place.
     use_map = cfg.map_mode != "none" and bool(map_tracks)
-    shown_place: str | None = None
 
     visual_clips, clip_audio, duck_windows = [], [], []
     sources_to_close = []
@@ -410,21 +505,10 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path: str, output_pa
                 overlays.append(map_overlay(Path(track.first), frame_size, cfg))
 
         caption = plan.captions.get(path, "")
-        # The header names the place, and only when the trip reaches a new one.
-        # Keyed on the resolved *name*, not the GPS cluster: a week in the
-        # mountains can produce twenty clusters that are all "Kitzbuehel", and
-        # re-titling every few clips would be noise.
-        header = None
-        if cfg.show_chapters:
-            here = place_headers.get(entry.group) if entry.group is not None else None
-            if here and here != shown_place:
-                header = here
-                shown_place = here
-            elif not here and plan_index in chapters:
-                header = chapters[plan_index]
-        if caption or header:
-            overlays.append(caption_overlay(caption, frame_size, header,
-                                            caption_band(frame_size, cfg, use_map)))
+        location = location_label(entry) if cfg.show_location else None
+        if caption or location:
+            overlays.append(caption_overlay(caption, frame_size,
+                                            caption_band(frame_size, cfg, use_map), location))
 
         try:
             clip = build_clip(entry, duration, frame_size, overlays, cfg, sources_to_close,
@@ -450,7 +534,9 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path: str, output_pa
                 if source.audio is not None:
                     audio = source.audio.subclipped(0, min(duration, source.audio.duration))
                     speaking = bool(entry.transcript)
-                    volume = 1.0 if speaking else cfg.ambient_volume
+                    volume = normalized_volume(audio_levels(entry),
+                                               1.0 if speaking else cfg.ambient_volume,
+                                               cfg.clip_target_db, cfg)
                     audio = audio.with_effects([
                         afx.MultiplyVolume(volume),
                         afx.AudioFadeIn(min(0.25, duration / 4)),

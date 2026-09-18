@@ -8,6 +8,7 @@ single corrupt file can never take the pipeline down.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -115,6 +116,32 @@ def extract_keyframes(path: str | Path, fps: float = 1.0, max_frames: int = 12,
         if single is not None:
             frames = [single]
     return frames
+
+
+_VOLUME_RE = re.compile(r"(mean|max)_volume:\s*(-?\d+(?:\.\d+)?) dB")
+
+
+def measure_audio(path: str | Path) -> dict[str, float] | None:
+    """Mean (RMS) and peak level of a file's audio, in dBFS.
+
+    Used to even out clips recorded at wildly different levels. ffmpeg's
+    `volumedetect` is one quick pass and, unlike EBU R128 integrated loudness,
+    stays meaningful on the two-second clips a phone produces.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+             "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("could not measure audio for %s: %s", Path(path).name, exc)
+        return None
+
+    found = {key: float(value) for key, value in _VOLUME_RE.findall(result.stderr or "")}
+    if "mean" not in found:
+        return None
+    return {"mean_db": found["mean"], "max_db": found.get("max", 0.0)}
 
 
 def has_audio_stream(path: str | Path) -> bool:
