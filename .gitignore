@@ -1,0 +1,22 @@
+# Kept in sync with the repository-root .gitignore, so the exclusions hold
+# whether git is initialised here or one level up.
+input/
+output/
+out/
+*.mp4
+*.mov
+*.MOV
+*.mp3
+*.wav
+*.m4a
+tmp/
+map_frames/
+timeline.json
+narrative.json
+.env
+*.key
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
