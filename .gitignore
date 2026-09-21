@@ -13,6 +13,8 @@ tmp/
 map_frames/
 timeline.json
 narrative.json
+music.json
+places.json
 .env
 *.key
 __pycache__/

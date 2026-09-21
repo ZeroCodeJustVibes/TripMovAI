@@ -144,6 +144,143 @@ def measure_audio(path: str | Path) -> dict[str, float] | None:
     return {"mean_db": found["mean"], "max_db": found.get("max", 0.0)}
 
 
+def release_memory() -> None:
+    """Hand freed memory back to the operating system.
+
+    Python releases the objects, but glibc keeps the arenas: after Phase 3
+    loads a 15 GB checkpoint and a 6 GB Whisper model, that memory stays in the
+    process's RSS for the rest of the run even though nothing references it.
+    `malloc_trim` returns it, which is why an interrupted run that skips those
+    phases looks so much leaner.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - torch may not be installed
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 - not glibc, nothing to do
+        pass
+
+
+def extracted_audio(path: str | Path, cache_dir: str | Path | None = None) -> str | None:
+    """The clip's soundtrack as a small WAV, cached.
+
+    Reading audio through a `VideoFileClip` costs a second persistent ffmpeg
+    reader per clip - with 25 videos in a cut that was 50 reader processes and
+    tens of gigabytes of buffers. A WAV is cheap to open and cheap to seek.
+    """
+    source = Path(path)
+    target_dir = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "tripvid_audio"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{source.stem}.wav"
+    if target.exists() and target.stat().st_size > 1024:
+        return str(target)
+    if not has_audio_stream(path):
+        return None
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path), "-map", "0:a:0",
+           "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(target)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=900, check=False)
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("could not extract audio from %s: %s", source.name, exc)
+        return None
+    return str(target) if target.exists() and target.stat().st_size > 1024 else None
+
+
+def nvenc_available() -> bool:
+    """Whether this ffmpeg can encode H.264 on the GPU."""
+    global _NVENC
+    if _NVENC is None:
+        try:
+            result = subprocess.run(["ffmpeg", "-v", "error", "-encoders"],
+                                    capture_output=True, text=True, timeout=30, check=False)
+            _NVENC = "h264_nvenc" in (result.stdout or "")
+        except (subprocess.SubprocessError, OSError):
+            _NVENC = False
+    return bool(_NVENC)
+
+
+_NVENC: bool | None = None
+_PLAYABLE: dict[str, str | None] = {}
+
+
+def _moviepy_opens(path: str | Path) -> bool:
+    try:
+        from moviepy import VideoFileClip
+
+        clip = VideoFileClip(str(path), audio=False)
+        clip.close()
+        return True
+    except Exception:  # noqa: BLE001 - that is exactly what we are testing for
+        return False
+
+
+def playable_video(path: str | Path, cache_dir: str | Path | None = None) -> str | None:
+    """A path MoviePy can actually open, remuxing the container if it cannot.
+
+    iPhone MOVs carry timecode and metadata streams alongside the picture, and
+    often a second spatial-audio track. MoviePy's ffmpeg info parser trips over
+    those streams and refuses the file - on a real library that was 14 of 73
+    videos, silently dropped from the film. ffmpeg itself reads them fine, so
+    the fix is to copy the picture and the first audio track into a clean
+    container: no re-encoding, about a second per clip, cached on disk.
+
+    Returns None only if even that fails, in which case the caller skips the
+    clip as it would any unreadable file.
+    """
+    key = str(Path(path).resolve())
+    if key in _PLAYABLE:
+        return _PLAYABLE[key]
+
+    if _moviepy_opens(path):
+        _PLAYABLE[key] = str(path)
+        return str(path)
+
+    target_dir = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "tripvid_remux"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{Path(path).stem}.mp4"
+
+    if not target.exists():
+        log.info("remuxing %s - its container upsets MoviePy", Path(path).name)
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+               "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+               "-movflags", "+faststart", str(target)]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=900, check=False)
+        except (subprocess.SubprocessError, OSError) as exc:
+            log.error("could not remux %s: %s", Path(path).name, exc)
+
+    if target.exists() and _moviepy_opens(target):
+        _PLAYABLE[key] = str(target)
+        return str(target)
+
+    log.error("%s cannot be read for assembly even after remuxing", Path(path).name)
+    _PLAYABLE[key] = None
+    return None
+
+
+def audio_duration(path: str | Path) -> float | None:
+    """Length of an audio (or video) file in seconds, without decoding it."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60, check=False)
+        return float(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        log.warning("could not read the length of %s", Path(path).name)
+        return None
+
+
 def has_audio_stream(path: str | Path) -> bool:
     try:
         res = subprocess.run(

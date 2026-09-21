@@ -6,7 +6,7 @@ Pillow>=10.2
 pillow-heif>=0.16
 pyexiftool>=0.5.6
 opencv-python>=4.9
-numpy>=1.26,<2.2
+numpy>=1.26
 python-dateutil>=2.9
 
 # Local NN inference (CUDA)
@@ -20,6 +20,9 @@ bitsandbytes>=0.43      # 8-bit BLIP-2 fallback when <8.5 GB VRAM is free
 
 # Selection / clustering
 scikit-learn>=1.4
+
+# Music analysis: beats, energy and drops, so the cut can follow the track
+librosa>=0.10
 
 # Map rendering: tiles are fetched and stitched directly (httpx), because the
 # per-location views, fly-to animation and shared tile cache need control that

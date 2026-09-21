@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -73,7 +73,7 @@ class MapConfig:
     # opacity: low while parked, high while travelling
     base_opacity: float = 0.60   # readable at rest ...
     move_opacity: float = 0.95   # ... and near-solid while travelling
-    move_grow: float = 2.2       # and briefly this many times its parked size
+    move_grow: float = 1.45      # and briefly this many times its parked size
 
     # 3d look: the terrain is shaded and raised from real elevation data, while
     # the map itself stays flat and north-up (tilt defaults to off)
@@ -81,7 +81,9 @@ class MapConfig:
     relief_lift: float = 0.030      # peak displacement, as a fraction of the view
     sun_azimuth: float = 315.0      # north-west light, the cartographic default
     sun_altitude: float = 42.0
-    tilt: float = 0.0               # >0 rakes the whole plane back into perspective
+    # A slight rake: enough that the shaded ridges read as height, not so much
+    # that the place names skew out of legibility.
+    tilt: float = 0.16              # >0 rakes the plane back into perspective
     attribution: bool = True        # OSM-derived tiles need crediting on screen
     route_color: tuple[int, int, int, int] = (70, 70, 78, 190)
     done_color: tuple[int, int, int, int] = (235, 92, 48, 255)
@@ -462,17 +464,25 @@ def apply_relief(view: Image.Image, dem: np.ndarray | None, zoom: int,
     if dem is None or cfg.relief <= 0:
         return view
 
+    # Fade the effect out as the view widens. Close in, the tiles are pale and
+    # the hillshade is what gives the terrain shape; zoomed out to a whole
+    # trip, OpenTopoMap is already heavily shaded and adding another pass turns
+    # the Alps into orange corduroy.
+    detail = max(0.0, min(1.0, (min(zoom, DEM_MAX_ZOOM) - 8) / 4.0))
+    strength = cfg.relief * detail
+    if strength <= 0.02:
+        return view
+
     rgba = np.asarray(view.convert("RGBA"), dtype=np.float32)
     cell = 156543.03392 * math.cos(math.radians(center[0])) / (2 ** min(zoom, DEM_MAX_ZOOM))
-    shade = hillshade(dem, cell, cfg)
+    shade = hillshade(dem, cell, replace(cfg, relief=strength))
 
     # Multiply with a floor, so shaded slopes stay readable rather than going
-    # black. The topo tiles already carry their own hillshade, so a full-range
-    # multiply here would double the contrast and crush the labels.
-    light = (0.72 + 0.50 * shade)[..., None]
+    # black, and blend the whole effect in by `strength`.
+    light = (1.0 + (0.72 + 0.50 * shade - 1.0) * strength)[..., None]
     rgba[..., :3] = np.clip(rgba[..., :3] * light, 0, 255)
 
-    lift = cfg.relief_lift * cfg.relief * view.size[1]
+    lift = cfg.relief_lift * strength * view.size[1]
     if lift >= 1.0:
         low, high = float(np.percentile(dem, 2)), float(np.percentile(dem, 98))
         if high - low > 30.0:                      # only where there is real relief
@@ -624,12 +634,12 @@ def _frame(fetcher: TileFetcher, center: tuple[float, float], zoom: int,
                             zoom, center, cfg)
     _draw_route(flat, origin, zoom, coords, upto, cfg)
 
+    # round before the warp, so a tilted map is still a card with soft corners
+    _round_corners(flat, cfg)
     tilted, forward = apply_tilt(flat, cfg)
     here = (lon_to_x(coords[upto][1], zoom) - origin[0], lat_to_y(coords[upto][0], zoom) - origin[1])
     _draw_pin(tilted, _project(forward, here), cfg)
 
-    if cfg.tilt <= 0:
-        _round_corners(tilted, cfg)
     if cfg.attribution:
         _draw_attribution(tilted, cfg)
     if opacity < 1.0:
@@ -675,6 +685,89 @@ def _draw_attribution(view: Image.Image, cfg: MapConfig) -> None:
     x, y = int(cfg.size * 0.02), cfg.size - size - int(cfg.size * 0.022)
     draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 150))
     draw.text((x, y), text, font=font, fill=(255, 255, 255, 225))
+
+
+def fit_view(coords: list[tuple[float, float]], size: int, cfg: MapConfig,
+             padding: float = 0.12) -> tuple[tuple[float, float], int]:
+    """Centre and the closest zoom at which every point still fits the square."""
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    center = ((min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2)
+    usable = size * (1 - 2 * padding)
+    for zoom in range(min(cfg.zoom + 3, 16), 2, -1):
+        xs = [lon_to_x(lon, zoom) for lon in lons]
+        ys = [lat_to_y(lat, zoom) for lat in lats]
+        if (max(xs) - min(xs)) <= usable and (max(ys) - min(ys)) <= usable:
+            return center, zoom
+    return center, 3
+
+
+def render_track_map(coords: list[tuple[float, float]], highlight: list[int] | None,
+                     out_path: Path, cfg: MapConfig, opacity: float = 0.97) -> Path | None:
+    """A standalone map card: the whole route in grey, part of it picked out.
+
+    Used by the day chapter cards (that day's track) and the closing card (the
+    whole trip), so both show where the film has been rather than a single pin.
+    """
+    if len(coords) < 2:
+        return None
+    focus = [coords[i] for i in highlight] if highlight else coords
+    if len(focus) < 2:                      # a day that never moved: show its surroundings
+        focus = [focus[0]] if focus else coords[:1]
+        center, zoom = focus[0], cfg.zoom
+    else:
+        center, zoom = fit_view(focus, cfg.size, cfg)
+
+    fetcher = TileFetcher(cfg)
+    dem_fetcher = TileFetcher(cfg, [DEM_TEMPLATE], "terrarium") if cfg.relief > 0 else None
+    try:
+        flat, origin = render_viewport(fetcher, center, zoom, cfg.size)
+        if dem_fetcher is not None:
+            flat = apply_relief(flat, render_dem(dem_fetcher, center, zoom, cfg.size),
+                                zoom, center, cfg)
+
+        draw = ImageDraw.Draw(flat)
+        def to_px(point):
+            return (lon_to_x(point[1], zoom) - origin[0], lat_to_y(point[0], zoom) - origin[1])
+
+        if len(coords) > 1:
+            draw.line([to_px(c) for c in coords], fill=cfg.route_color,
+                      width=cfg.line_width, joint="curve")
+        # with no day to pick out, the whole trip is the highlight
+        run_indexes = highlight if highlight else list(range(len(coords)))
+        if len(run_indexes) > 1:
+            run = [to_px(coords[i]) for i in run_indexes]
+            draw.line(run, fill=cfg.done_color, width=cfg.line_width + 3, joint="curve")
+            for point, colour in ((run[0], (255, 255, 255, 245)), (run[-1], cfg.done_color)):
+                r = cfg.marker_radius * 0.8
+                draw.ellipse([point[0] - r - 2, point[1] - r - 2, point[0] + r + 2, point[1] + r + 2],
+                             fill=(255, 255, 255, 240))
+                draw.ellipse([point[0] - r, point[1] - r, point[0] + r, point[1] + r], fill=colour)
+
+        _round_corners(flat, cfg)
+        tilted, _ = apply_tilt(flat, cfg)
+        if cfg.attribution:
+            _draw_attribution(tilted, cfg)
+        if opacity < 1.0:
+            tilted.putalpha(tilted.getchannel("A").point(lambda v: int(v * opacity)))
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        tilted.save(out_path)
+        return Path(out_path)
+    except Exception as exc:  # noqa: BLE001 - a missing card map is not fatal
+        log.warning("could not render track map %s: %s", out_path, exc)
+        return None
+    finally:
+        fetcher.close()
+        if dem_fetcher is not None:
+            dem_fetcher.close()
+
+
+def route_for(timeline: Timeline, ordered_paths: list[str]) -> list[tuple[float, float]]:
+    """The interpolated route used by every map in the film."""
+    raw = route_points(timeline, ordered_paths)
+    if sum(1 for p in raw if p is not None) < MIN_GPS_POINTS:
+        return []
+    return interpolate(raw)
 
 
 def _ease(t: float) -> float:

@@ -36,6 +36,9 @@ class UnderstandConfig:
     max_new_tokens: int = 24
     num_beams: int = 3
     transcribe: bool = True
+    find_highlights: bool = True     # scan long videos for their best moments
+    highlight_budget: float = 15.0
+    highlight_segments: int = 3
 
 
 def _free() -> None:
@@ -374,6 +377,44 @@ def transcribe_entries(entries: list[TimelineEntry], cfg: UnderstandConfig,
     return done
 
 
+# ---------------------------------------------------------- highlights
+
+def scan_highlights(entries: list[TimelineEntry], cfg: UnderstandConfig,
+                    progress_cb: Callable | None = None,
+                    checkpoint: Callable | None = None) -> int:
+    """Work out which stretch of each long video is worth using.
+
+    Runs after Whisper on purpose: speech is the strongest signal for what
+    matters in a clip, and by now the transcript segments are known.
+    """
+    import highlights as highlight_module
+
+    todo = [e for e in entries if e.is_video and "highlights" not in e.extra]
+    if not todo:
+        return 0
+
+    config = highlight_module.HighlightConfig(budget=cfg.highlight_budget,
+                                              max_segments=cfg.highlight_segments)
+    done = 0
+    for entry in todo:
+        try:
+            segments = highlight_module.highlights_for(
+                entry.filepath, entry.duration, config, entry.extra.get("speech_segments"))
+            entry.extra["highlights"] = [[round(s, 2), round(e, 2)] for s, e in segments]
+        except Exception as exc:  # noqa: BLE001 - fall back to the opening seconds
+            log.error("highlight scan failed for %s: %s", entry.name, exc)
+            entry.extra["highlights"] = []
+        done += 1
+        if checkpoint:
+            checkpoint()
+        if progress_cb:
+            progress_cb(done, len(todo))
+    trimmed = sum(1 for e in todo if e.extra.get("highlights")
+                  and sum(b - a for a, b in e.extra["highlights"]) < e.duration - 0.5)
+    log.info("scanned %d video(s); %d trimmed to their highlights", done, trimmed)
+    return done
+
+
 # -------------------------------------------------------------- pipeline
 
 def run(timeline: Timeline, cfg: UnderstandConfig,
@@ -389,13 +430,19 @@ def run(timeline: Timeline, cfg: UnderstandConfig,
     caption_entries(entries, cfg, progress.get("caption"), checkpoint)
     if cfg.transcribe:
         transcribe_entries(entries, cfg, progress.get("whisper"), checkpoint)
+    if cfg.find_highlights:
+        scan_highlights(entries, cfg, progress.get("highlights"), checkpoint)
     return timeline
 
 
 def stats(timeline: Timeline) -> dict[str, object]:
     sel = timeline.selected
+    scanned = [e for e in sel if e.extra.get("highlights")]
     return {
         "captioned": sum(1 for e in sel if e.caption),
+        "videos_trimmed_to_highlights": sum(
+            1 for e in scanned
+            if sum(b - a for a, b in e.extra["highlights"]) < e.duration - 0.5),
         "mean_confidence": round(
             sum(e.caption_confidence or 0.0 for e in sel) / max(1, sum(1 for e in sel if e.caption)), 3),
         "videos_with_speech": sum(1 for e in sel if e.is_video and e.transcript),

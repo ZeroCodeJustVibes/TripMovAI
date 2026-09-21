@@ -35,6 +35,23 @@ DEDUP_SIMILARITY = 0.88
 GROUP_SHARE_CAP = 0.30  # no single location may own more than 30% of the cut
 CLIP_MODEL = "openai/clip-vit-base-patch32"
 
+# Zero-shot prompts for "is anyone in this?". CLIP is already loaded for
+# deduplication, so asking it this costs one extra pass over short text.
+PEOPLE_PROMPTS = (
+    "a photo of a person",
+    "a photo of people together",
+    "a selfie of people smiling",
+    "a portrait of someone",
+    "friends posing for a photo",
+)
+NO_PEOPLE_PROMPTS = (
+    "an empty landscape with nobody in it",
+    "a photo of scenery",
+    "a close-up photo of an object",
+    "a photo of food on a table",
+    "an empty room",
+)
+
 
 @dataclass
 class SelectionConfig:
@@ -43,14 +60,23 @@ class SelectionConfig:
     dedup_similarity: float = DEDUP_SIMILARITY
     min_video_seconds: float = MIN_VIDEO_SECONDS
     group_share_cap: float = GROUP_SHARE_CAP
+    keep_all_videos: bool = False   # every video in the folder makes the cut
+    prefer_people: bool = False     # bias the cut towards shots with people in them
+    people_weight: float = 0.35     # how strongly, relative to picture quality
     device: str = "cuda"
 
 
 # ------------------------------------------------------ A. quality gate
 
 def score_entry(entry: TimelineEntry, cfg: SelectionConfig) -> None:
-    """Fill blur_score / brightness / quality_score, and drop_reason if bad."""
-    if entry.is_video and entry.duration and entry.duration < cfg.min_video_seconds:
+    """Fill blur_score / brightness / quality_score, and drop_reason if bad.
+
+    With `keep_all_videos` a video is still measured - the scores order it
+    against everything else - but only an unreadable file is dropped.
+    """
+    spare_video = cfg.keep_all_videos and entry.is_video
+    if (entry.is_video and not spare_video
+            and entry.duration and entry.duration < cfg.min_video_seconds):
         entry.drop_reason = f"video shorter than {cfg.min_video_seconds:g}s"
         entry.quality_score = 0.0
         return
@@ -69,7 +95,9 @@ def score_entry(entry: TimelineEntry, cfg: SelectionConfig) -> None:
 
     # exposure first: a near-black frame is "too dark", not "blurry", even
     # though it also has almost no high-frequency detail left to measure
-    if entry.brightness < DARK_LIMIT:
+    if spare_video:
+        entry.drop_reason = None
+    elif entry.brightness < DARK_LIMIT:
         entry.drop_reason = f"too dark ({entry.brightness:.0f})"
     elif entry.brightness > BRIGHT_LIMIT:
         entry.drop_reason = f"blown out ({entry.brightness:.0f})"
@@ -107,9 +135,45 @@ def quality_gate(timeline: Timeline, cfg: SelectionConfig, progress_cb: Callable
 
 # -------------------------------------------------------- B. dedup (CLIP)
 
+def _people_probabilities(model, processor_cls, embeddings: np.ndarray, device: str,
+                          torch) -> np.ndarray | None:
+    """How likely each image is to contain people, from its CLIP embedding.
+
+    Compares the picture against two sets of captions and takes the softmax, so
+    the answer is a probability rather than a raw similarity that would need
+    its own threshold per library.
+    """
+    try:
+        from transformers import CLIPTokenizer
+
+        tokenizer = CLIPTokenizer.from_pretrained(CLIP_MODEL)
+        prompts = list(PEOPLE_PROMPTS) + list(NO_PEOPLE_PROMPTS)
+        tokens = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
+        with torch.no_grad():
+            text = model.get_text_features(**tokens)
+            text = getattr(text, "pooler_output", getattr(text, "text_embeds", text))
+            text = (text / text.norm(dim=-1, keepdim=True)).float().cpu().numpy()
+    except Exception as exc:  # noqa: BLE001 - tokenizer or model shape trouble
+        log.warning("could not score for people (%s)", exc)
+        return None
+
+    similarity = embeddings @ text.T                      # (n, prompts)
+    people = similarity[:, : len(PEOPLE_PROMPTS)].max(axis=1)
+    scenery = similarity[:, len(PEOPLE_PROMPTS) :].max(axis=1)
+    scaled = np.stack([people, scenery], axis=1) * 100.0  # CLIP's logit scale
+    scaled -= scaled.max(axis=1, keepdims=True)
+    odds = np.exp(scaled)
+    return odds[:, 0] / odds.sum(axis=1)
+
+
 def clip_embeddings(entries: Sequence[TimelineEntry], device: str = "cuda",
-                    progress_cb: Callable | None = None) -> np.ndarray | None:
-    """L2-normalised CLIP image embeddings, shape (n, d). None if CLIP fails."""
+                    progress_cb: Callable | None = None,
+                    score_people: bool = False) -> np.ndarray | None:
+    """L2-normalised CLIP image embeddings, shape (n, d). None if CLIP fails.
+
+    With `score_people`, each entry also gets `extra["people"]` - the chance
+    that someone is in the shot - while the model is loaded anyway.
+    """
     if not entries:
         return None
     try:
@@ -152,6 +216,14 @@ def clip_embeddings(entries: Sequence[TimelineEntry], device: str = "cuda",
                 vectors.append(out)
                 if progress_cb:
                     progress_cb(min(start + batch_size, len(entries)), len(entries))
+        embeddings = np.vstack(vectors) if vectors else None
+        if score_people and embeddings is not None:
+            probabilities = _people_probabilities(model, None, embeddings, device, torch)
+            if probabilities is not None:
+                for entry, probability in zip(entries, probabilities):
+                    entry.extra["people"] = round(float(probability), 4)
+                with_people = int((probabilities > 0.5).sum())
+                log.info("people in %d of %d shots", with_people, len(entries))
     except Exception as exc:  # noqa: BLE001
         log.warning("CLIP inference failed (%s) - skipping deduplication", exc)
         return None
@@ -165,7 +237,7 @@ def clip_embeddings(entries: Sequence[TimelineEntry], device: str = "cuda",
         except Exception:  # noqa: BLE001
             pass
 
-    return np.vstack(vectors) if vectors else None
+    return embeddings
 
 
 def deduplicate(entries: list[TimelineEntry], cfg: SelectionConfig,
@@ -173,7 +245,7 @@ def deduplicate(entries: list[TimelineEntry], cfg: SelectionConfig,
     """Collapse near-identical shots, keeping the sharpest of each set."""
     if len(entries) < 2:
         return entries
-    embeddings = clip_embeddings(entries, cfg.device, progress_cb)
+    embeddings = clip_embeddings(entries, cfg.device, progress_cb, cfg.prefer_people)
     if embeddings is None:
         return entries
 
@@ -203,7 +275,10 @@ def deduplicate(entries: list[TimelineEntry], cfg: SelectionConfig,
     kept: list[TimelineEntry] = []
     dropped = 0
     def _best(indexes: list[int]) -> int:
-        return max(indexes, key=lambda i: (entries[i].blur_score or 0.0,
+        """Of a set of near-duplicates, the one to keep: the sharpest, unless
+        `--prefer-people` says one of them has someone in it."""
+        return max(indexes, key=lambda i: (rank_of(entries[i], cfg) if cfg.prefer_people else 0.0,
+                                           entries[i].blur_score or 0.0,
                                            entries[i].quality_score or 0.0,
                                            entries[i].duration or 0.0))
 
@@ -212,10 +287,11 @@ def deduplicate(entries: list[TimelineEntry], cfg: SelectionConfig,
         # sound a still cannot - but duplicate videos of the same thing still
         # collapse to the best one. Immich exports routinely contain a
         # "name+1.mp4" twin of every clip, and both would otherwise be used.
+        # `keep_all_videos` turns that off: every video survives dedup.
         videos = [i for i in members if entries[i].is_video]
         photos = [i for i in members if not entries[i].is_video]
-        winners = set()
-        if videos:
+        winners = set(videos) if cfg.keep_all_videos else set()
+        if videos and not cfg.keep_all_videos:
             winners.add(_best(videos))
         if photos:
             winners.add(_best(photos))
@@ -276,12 +352,28 @@ def assign_groups(entries: list[TimelineEntry], eps_km: float = 1.0, time_gap_ho
     return n_groups
 
 
-def _spread_pick(candidates: list[TimelineEntry], quota: int) -> list[TimelineEntry]:
+def rank_of(entry: TimelineEntry, cfg: SelectionConfig) -> float:
+    """What a shot is worth when competing for a place in the cut.
+
+    Picture quality on its own is blind to what a trip film is usually about.
+    With `--prefer-people` a shot with someone in it gets a bonus, so a decent
+    photo of the group beats a marginally sharper one of an empty street - but
+    quality still decides between two shots that both have people.
+    """
+    score = entry.quality_score or 0.0
+    if cfg.prefer_people:
+        score += cfg.people_weight * float(entry.extra.get("people") or 0.0)
+    return score
+
+
+def _spread_pick(candidates: list[TimelineEntry], quota: int,
+                 cfg: SelectionConfig | None = None) -> list[TimelineEntry]:
     """Take `quota` entries spread over the group's time range, best of each slice."""
     if quota <= 0 or not candidates:
         return []
     if quota >= len(candidates):
         return list(candidates)
+    cfg = cfg or SelectionConfig()
     ordered = sorted(candidates, key=lambda e: (e.timestamp or "", e.name))
     picked: list[TimelineEntry] = []
     n = len(ordered)
@@ -289,10 +381,10 @@ def _spread_pick(candidates: list[TimelineEntry], quota: int) -> list[TimelineEn
         lo, hi = int(k * n / quota), max(int((k + 1) * n / quota), int(k * n / quota) + 1)
         window = [e for e in ordered[lo:hi] if e not in picked]
         if window:
-            picked.append(max(window, key=lambda e: e.quality_score or 0.0))
-    # a short window may have yielded nothing - top up by quality
+            picked.append(max(window, key=lambda e: rank_of(e, cfg)))
+    # a short window may have yielded nothing - top up by rank
     if len(picked) < quota:
-        for e in sorted(ordered, key=lambda e: -(e.quality_score or 0.0)):
+        for e in sorted(ordered, key=lambda e: -rank_of(e, cfg)):
             if e not in picked:
                 picked.append(e)
             if len(picked) == quota:
@@ -310,8 +402,12 @@ def balanced_select(entries: list[TimelineEntry], cfg: SelectionConfig) -> list[
 
     target = min(cfg.max_clips, len(entries))
     chosen: list[TimelineEntry] = [e for e in entries if e.is_video]  # videos always ride along
-    if len(chosen) > target:
-        chosen = sorted(chosen, key=lambda e: -(e.quality_score or 0.0))[:target]
+    if len(chosen) > target and not cfg.keep_all_videos:
+        chosen = sorted(chosen, key=lambda e: -rank_of(e, cfg))[:target]
+    elif len(chosen) > target:
+        # the caller asked for every video, so the cut is as long as they are
+        log.info("keeping all %d video(s), which is more than --max-clips %d",
+                 len(chosen), cfg.max_clips)
     chosen_set = set(id(e) for e in chosen)
 
     cap = max(1, int(math.floor(cfg.group_share_cap * target)))
@@ -357,7 +453,7 @@ def balanced_select(entries: list[TimelineEntry], cfg: SelectionConfig) -> list[
 
     for label, members in groups.items():
         photos = [e for e in members if not e.is_video and id(e) not in chosen_set]
-        chosen.extend(_spread_pick(photos, quotas.get(label, 0)))
+        chosen.extend(_spread_pick(photos, quotas.get(label, 0), cfg))
 
     chosen.sort(key=lambda e: (e.timestamp or "", e.name))
     return chosen
@@ -384,8 +480,11 @@ def run(timeline: Timeline, cfg: SelectionConfig, progress: dict[str, Callable] 
         if not e.selected and e.drop_reason is None:
             e.drop_reason = "not needed for target clip count"
 
-    log.info("selected %d clips (%d videos) from %d files",
-             len(chosen), sum(1 for e in chosen if e.is_video), len(timeline))
+    videos_in = sum(1 for e in timeline if e.is_video)
+    videos_out = sum(1 for e in chosen if e.is_video)
+    log.info("selected %d clips (%d of %d videos%s) from %d files",
+             len(chosen), videos_out, videos_in,
+             ", all kept" if cfg.keep_all_videos else "", len(timeline))
     return timeline
 
 
@@ -396,9 +495,11 @@ def stats(timeline: Timeline) -> dict[str, object]:
         if not e.selected and e.drop_reason:
             key = e.drop_reason.split(" (")[0]
             reasons[key] = reasons.get(key, 0) + 1
+    with_people = [e for e in chosen if (e.extra.get("people") or 0) > 0.5]
     return {
         "selected": len(chosen),
         "videos": sum(1 for e in chosen if e.is_video),
+        "with people": len(with_people) if any("people" in e.extra for e in timeline) else "-",
         "groups": len({e.group for e in chosen if e.group is not None}),
         "dropped_by": reasons,
     }

@@ -187,6 +187,8 @@ class NarrativePlan:
     transition_hints: dict[str, str] = field(default_factory=dict)
     chapter_markers: list[ChapterMarker] = field(default_factory=list)
     mood: str = ""
+    day_titles: dict[str, str] = field(default_factory=dict)   # keyed by ISO date
+    closing_quote: str = ""
 
     VALID_TRANSITIONS = ("crossfade", "cut", "fadein")
 
@@ -201,6 +203,8 @@ class NarrativePlan:
             "transition_hints": self.transition_hints,
             "chapter_markers": [c.to_dict() for c in self.chapter_markers],
             "mood": self.mood,
+            "day_titles": self.day_titles,
+            "closing_quote": self.closing_quote,
         }
 
     @classmethod
@@ -218,6 +222,9 @@ class NarrativePlan:
             transition_hints={str(k): str(v) for k, v in (d.get("transition_hints") or {}).items()},
             chapter_markers=markers,
             mood=str(d.get("mood") or ""),
+            day_titles={str(k): " ".join(str(v).split())
+                        for k, v in (d.get("day_titles") or {}).items() if v},
+            closing_quote=" ".join(str(d.get("closing_quote") or "").split()),
         )
 
     @classmethod

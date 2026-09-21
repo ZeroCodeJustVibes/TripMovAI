@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import sys
+
+import numpy as np
 import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -288,15 +290,17 @@ class TestAssemble:
         assert gain(np.array([15.0]))[0] == pytest.approx(0.15)
         assert 0.15 < gain(np.array([9.8]))[0] < 1.0  # fading down
 
-    def test_caption_overlay_is_transparent_outside_the_bar(self):
-        img = assemble.caption_overlay("A short caption", (800, 600))
+    def test_caption_overlay_is_transparent_outside_the_card(self):
+        layout = assemble.layout_for((800, 600), (800, 600), assemble.AssembleConfig())
+        img = assemble.caption_overlay("A short caption", layout, assemble.AssembleConfig())
         assert img.size == (800, 600)
         assert img.getpixel((400, 30))[3] == 0          # nothing at the top
         assert any(img.getpixel((x, y))[3] > 0
                    for x in range(40, 400) for y in range(430, 590))
 
     def test_no_caption_no_overlay(self):
-        assert assemble.caption_overlay("", (800, 600)) is None
+        layout = assemble.layout_for((800, 600), (800, 600), assemble.AssembleConfig())
+        assert assemble.caption_overlay("", layout, assemble.AssembleConfig()) is None
 
 
 # ------------------------------------------------------------ models
@@ -323,110 +327,115 @@ class TestTimeline:
         assert plan.captions == {} and len(plan.ordered_clips) == 2
 
 
-class TestCaptionBand:
-    def test_overlay_band_is_the_full_width(self):
-        # the map moved to the top-left corner, so the caption has the run of
-        # the bottom of the frame again
-        cfg = assemble.AssembleConfig(map_mode="overlay")
-        assert assemble.caption_band((1000, 600), cfg, has_map=True) == (0, 1000)
+class TestLayout:
+    """One grid: a fixed UI column, the picture taking everything left over."""
 
-    def test_map_sits_top_left_in_overlay_mode(self):
-        cfg = assemble.AssembleConfig(map_mode="overlay")
-        size, (x, y) = assemble.map_geometry((1920, 1080), cfg)
-        assert x < 1920 * 0.05 and y < 1080 * 0.05           # tucked into the corner
-        assert size == pytest.approx(1920 * 0.14, abs=2)     # half the previous size
-        assert size + y < 1080 * 0.35                        # nowhere near the caption
+    cfg = assemble.AssembleConfig()
 
-    def test_side_band_stops_left_of_the_panel(self):
-        cfg = assemble.AssembleConfig(map_mode="side", side_panel_fraction=0.30)
-        assert assemble.caption_band((1000, 600), cfg, has_map=True) == (0, 700)
+    def test_landscape_sits_flush_beside_the_column(self):
+        layout = assemble.layout_for((4000, 3000), (1920, 1080), self.cfg)
+        x, y, w, h = layout.card
+        size, (map_x, map_y) = assemble.map_geometry(layout, self.cfg)
+        assert map_x + size <= x                      # map entirely left of the picture
+        assert x - (map_x + size) < layout.gap * 2    # and flush against it
+        assert h == pytest.approx(1080 - 2 * round(0.024 * 1920), abs=2)   # full height
 
-    def test_no_map_uses_the_whole_width(self):
-        cfg = assemble.AssembleConfig(map_mode="overlay")
-        assert assemble.caption_band((1000, 600), cfg, has_map=False) == (0, 1000)
+    def test_map_fills_the_column(self):
+        layout = assemble.layout_for((4000, 3000), (1920, 1080), self.cfg)
+        size, _ = assemble.map_geometry(layout, self.cfg)
+        assert size == pytest.approx(round(0.24 * 1920), abs=2)
+        assert size > 400          # far bigger than the old badge
 
-    def test_caption_sits_bottom_left(self):
-        img = assemble.caption_overlay("Nobody admits being lost", (1000, 600))
-        pixels = img.load()
-        bottom_left = any(pixels[x, y][3] > 0 for x in range(20, 400) for y in range(480, 580))
-        bottom_right = any(pixels[x, y][3] > 0 for x in range(700, 990) for y in range(480, 580))
-        top = any(pixels[x, y][3] > 0 for x in range(0, 1000) for y in range(0, 100))
-        assert bottom_left and not bottom_right and not top
+    def test_picture_keeps_its_aspect_and_stays_in_frame(self):
+        for media in [(4000, 3000), (1600, 1067), (1920, 1080), (3024, 4032)]:
+            layout = assemble.layout_for(media, (1920, 1080), self.cfg)
+            x, y, w, h = layout.card
+            assert w / h == pytest.approx(media[0] / media[1], rel=0.02)
+            assert x >= 0 and y >= 0 and x + w <= 1920 and y + h <= 1080
 
+    def test_without_a_map_the_picture_takes_the_whole_frame(self):
+        cfg = assemble.AssembleConfig(map_mode="none")
+        wide = assemble.layout_for((1600, 1067), (1920, 1080), cfg, with_map=False)
+        columned = assemble.layout_for((1600, 1067), (1920, 1080), self.cfg)
+        assert wide.card[2] > columned.card[2]        # bigger without the column
+        x, y, w, h = wide.card
+        assert wide.ui_left >= x and wide.ui_bottom <= y + h   # caption sits on it
 
-class _RejectJsonModeHandler(_MockHandler):
-    """Rejects the request while `response_format` is present, like some models."""
+    def test_ui_column_does_not_move_between_clips(self):
+        wide = assemble.layout_for((4000, 3000), (1920, 1080), self.cfg)
+        tall = assemble.layout_for((3024, 4032), (1920, 1080), self.cfg)
+        assert (wide.ui_left, wide.ui_top, wide.ui_right) == (tall.ui_left, tall.ui_top, tall.ui_right)
 
-    def do_POST(self):
-        length = int(self.headers["Content-Length"])
-        body = json.loads(self.rfile.read(length))
-        _MockHandler.received.append(body)
-        if "response_format" in body:
-            self.send_response(400)
-            payload = b'{"error": "response_format is not supported"}'
-        else:
-            self.send_response(200)
-            payload = json.dumps({"choices": [{"message": {"content": json.dumps(
-                {"ordered_clips": ["c0", "c1", "c2"], "mood": "plain mode"})}}]}).encode()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-
-def test_retries_without_json_mode(three_clip_timeline):
-    server = HTTPServer(("127.0.0.1", 0), _RejectJsonModeHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    _MockHandler.replies, _MockHandler.received = [], []
-    try:
-        plan = narrative.plan_narrative(three_clip_timeline, narrative.NarrativeConfig(
-            base_url=f"http://127.0.0.1:{server.server_port}", api_key="k"))
-    finally:
-        server.shutdown()
-    sent = [b.get("response_format") is not None for b in _MockHandler.received]
-    assert sent[:2] == [True, False]      # json mode rejected, retried without it
-    assert plan.mood == "plain mode"
-
-
-class TestRenderIntegration:
-    """A real (tiny) render: exercises MoviePy, the audio mix and the layout."""
-
-    @staticmethod
-    def _photo(path: Path, color: tuple[int, int, int]) -> None:
+    def test_backdrop_fills_the_frame_and_is_dimmed(self):
+        import numpy as np
         from PIL import Image
-        Image.new("RGB", (320, 240), color).save(path, quality=90)
+        source = Image.new("RGB", (400, 300), (220, 200, 180))
+        layout = assemble.layout_for((400, 300), (640, 360), self.cfg)
+        plate = assemble.backdrop(source, layout, self.cfg)
+        assert plate.size == (640, 360)
+        assert np.asarray(plate.convert("RGB")).mean() < 200
 
-    def test_renders_and_skips_unknown_planned_clips(self, tmp_path, tiny_music):
-        import subprocess
-        a, b = tmp_path / "a.jpg", tmp_path / "b.jpg"
-        self._photo(a, (30, 90, 160))
-        self._photo(b, (160, 90, 30))
-        music = tiny_music
+    def test_card_border_is_drawn_per_panel(self):
+        layout = assemble.layout_for([(3024, 4032), (3024, 4032)], (1920, 1080), self.cfg)
+        overlay = assemble.card_border_overlay(layout, self.cfg)
+        pixels = overlay.load()
+        assert len(layout.panels) == 2
+        for x, y, w, h in layout.panels:
+            assert pixels[x + w // 2, y][3] > 0        # each panel outlined
+        mid = (layout.panels[0][0] + layout.panels[0][2] + layout.panels[1][0]) // 2
+        assert pixels[mid, layout.panels[0][1] + 10][3] == 0   # gap between them is clear
 
-        entries = []
-        for path in (a, b):
-            e = TimelineEntry(filepath=str(path), type="photo", timestamp="2024-06-12T08:00:00")
-            e.width, e.height, e.selected = 320, 240, True
-            entries.append(e)
-        tl = Timeline(entries)
 
-        plan = NarrativePlan(
-            ordered_clips=[str(a), "/gone/missing.jpg", str(b)],   # middle clip cannot resolve
-            captions={str(b): "Second frame"},
-            transition_hints={str(b): "cut"},
-        )
-        out = tmp_path / "out.mp4"
-        cfg = assemble.AssembleConfig(photo_duration=1.0, fps=6, preset="ultrafast",
-                                      map_mode="none", resolution=(320, 240))
-        assemble.assemble(tl, plan, music, str(out), None, cfg)  # no map
+class TestPortraitPairing:
+    """Two tall photos side by side beat one tall photo and a lot of blur."""
 
-        assert out.exists() and out.stat().st_size > 0
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(out)], capture_output=True, text=True, check=True)
-        assert float(probe.stdout.strip()) == pytest.approx(2.0, abs=0.35)  # two 1s photos
-        strays = list(Path.cwd().glob(f"{out.stem}TEMP_MPY*")) + list(tmp_path.glob("*TEMP_MPY*"))
-        assert not strays, f"left MoviePy temp files behind: {strays}"
+    cfg = assemble.AssembleConfig()
+
+    def _entries(self, shapes):
+        out = []
+        for i, (w, h) in enumerate(shapes):
+            e = entry(f"p{i}.jpg", i, kind="video" if w == 0 else "photo")
+            e.width, e.height = (abs(w) or 1920), h
+            out.append((i, e.filepath, e))
+        return out
+
+    def test_two_portraits_pair_up(self):
+        entries = self._entries([(3024, 4032), (3024, 4032), (4000, 3000)])
+        paired = assemble.pair_portraits(entries, self.cfg, animated=set())
+        assert len(paired) == 2                      # three clips became two
+        assert paired[0][3] is not None              # first has a companion
+        assert paired[1][3] is None                  # the landscape stands alone
+
+    def test_landscape_never_pairs(self):
+        entries = self._entries([(4000, 3000), (4000, 3000)])
+        paired = assemble.pair_portraits(entries, self.cfg, animated=set())
+        assert [item[3] for item in paired] == [None, None]
+
+    def test_videos_never_pair(self):
+        entries = self._entries([(1080, 1920), (1080, 1920)])
+        for _, _, e in entries:
+            e.type = "video"
+        paired = assemble.pair_portraits(entries, self.cfg, animated=set())
+        assert [item[3] for item in paired] == [None, None]
+
+    def test_a_flying_map_keeps_its_own_clip(self):
+        entries = self._entries([(3024, 4032), (3024, 4032)])
+        paired = assemble.pair_portraits(entries, self.cfg, animated={1})
+        assert [item[3] for item in paired] == [None, None]
+
+    def test_pairing_can_be_switched_off(self):
+        entries = self._entries([(3024, 4032), (3024, 4032)])
+        off = assemble.AssembleConfig(pair_portraits=False)
+        assert [item[3] for item in assemble.pair_portraits(entries, off, set())] == [None, None]
+
+    def test_a_pair_fills_more_of_the_picture_area(self):
+        single = assemble.layout_for((3024, 4032), (1920, 1080), self.cfg)
+        pair = assemble.layout_for([(3024, 4032), (3024, 4032)], (1920, 1080), self.cfg)
+        assert len(pair.panels) == 2
+        single_area = single.card[2] * single.card[3]
+        pair_area = sum(w * h for _, _, w, h in pair.panels)
+        assert pair_area > single_area * 1.4
+        assert pair.card[0] + pair.card[2] <= 1920
 
 
 class TestUnderstandCaching:
@@ -511,8 +520,9 @@ class TestNoTopHeader:
     """The title at the top was removed: the location line names the place."""
 
     def test_overlay_draws_nothing_in_the_top_strip(self):
-        img = assemble.caption_overlay("Nobody admits being lost", (1000, 600),
-                                       location="Interlaken · 568 m")
+        layout = assemble.layout_for((1000, 600), (1000, 600), assemble.AssembleConfig())
+        img = assemble.caption_overlay("Nobody admits being lost", layout,
+                                       assemble.AssembleConfig(), location="Interlaken · 568 m")
         pixels = img.load()
         assert not any(pixels[x, y][3] > 0
                        for x in range(0, 1000) for y in range(0, 220))
@@ -579,8 +589,9 @@ class TestLocationLabel:
         assert assemble.location_label(entry("a.jpg")) is None
 
     def test_label_is_drawn_below_the_caption(self):
-        img = assemble.caption_overlay("Nobody admits being lost", (1000, 600),
-                                       location="Kitzbuehel · 1,878 m")
+        layout = assemble.layout_for((1000, 600), (1000, 600), assemble.AssembleConfig())
+        img = assemble.caption_overlay("Nobody admits being lost", layout,
+                                       assemble.AssembleConfig(), location="Kitzbuehel · 1,878 m")
         pixels = img.load()
         rows = [y for y in range(300, 600)
                 if any(pixels[x, y][3] > 0 for x in range(20, 500))]
@@ -702,10 +713,10 @@ class TestMapSwell:
 
     def test_canvas_fits_the_largest_frame_and_holds_position(self, tmp_path):
         cfg = assemble.AssembleConfig(map_mode="overlay")
-        frame_size = (1920, 1080)
-        size, position = assemble.map_geometry(frame_size, cfg)
+        layout = assemble.layout_for((1600, 1067), (1920, 1080), cfg)
+        size, position = assemble.map_geometry(layout, cfg)
         track = self._track(tmp_path, [1.0, 1.6, 2.2, 1.0])
-        clip = assemble.map_animation_clip(track, frame_size, cfg, 3.0)
+        clip = assemble.map_animation_clip(track, layout, cfg, 3.0)
         assert clip is not None
         canvas = clip.get_frame(0).shape[0]
         assert canvas == pytest.approx(size * 2.2, abs=2)   # room for the swell
@@ -714,8 +725,9 @@ class TestMapSwell:
     def test_map_grows_then_shrinks_over_time(self, tmp_path):
         import numpy as np
         cfg = assemble.AssembleConfig(map_mode="overlay")
+        layout = assemble.layout_for((1600, 1067), (1920, 1080), cfg)
         track = self._track(tmp_path, [1.0, 1.6, 2.2, 1.0])
-        clip = assemble.map_animation_clip(track, (1920, 1080), cfg, 4.0)
+        clip = assemble.map_animation_clip(track, layout, cfg, 4.0)
         mask = clip.mask
 
         def covered(t):
@@ -747,3 +759,849 @@ class TestAltitude:
         from ingest import _valid_altitude
         assert _valid_altitude(99999) is None
         assert _valid_altitude("not a number") is None
+
+
+
+
+class TestCaptionFitsTheColumn:
+    cfg = assemble.AssembleConfig()
+
+    @pytest.mark.parametrize("location", [
+        "Hall in Tirol · 558 m",
+        "Matrei in Osttirol · 2,177 m",
+        "Neukirchen am Großvenediger · 1,487 m",     # the longest real name
+        "47.2712, 11.5134 · 1,878 m",
+    ])
+    def test_location_never_overflows(self, location):
+        layout = assemble.layout_for((4000, 3000), (1920, 1080), self.cfg)
+        img = assemble.caption_overlay("Nobody admits being lost", layout, self.cfg,
+                                       location=location)
+        pixels = img.load()
+        inked = [x for x in range(1920)
+                 if any(pixels[x, y][3] > 0 for y in range(700, 1080))]
+        assert max(inked) <= layout.ui_right    # stays inside the column
+        assert min(inked) >= layout.ui_left - layout.gap
+
+    def test_long_caption_wraps_rather_than_clipping(self):
+        layout = assemble.layout_for((4000, 3000), (1920, 1080), self.cfg)
+        img = assemble.caption_overlay("A caption long enough to need three whole lines",
+                                       layout, self.cfg, location="Innsbruck · 574 m")
+        pixels = img.load()
+        rows = [y for y in range(1080) if any(pixels[x, y][3] > 0 for x in range(0, 700))]
+        assert max(rows) - min(rows) > 100      # it grew downward instead of clipping
+
+
+class TestDayCards:
+    cfg = assemble.AssembleConfig()
+
+    def _timeline(self):
+        entries = []
+        for day, (date, count) in enumerate([("2026-02-25", 3), ("2026-02-26", 2)]):
+            for i in range(count):
+                e = entry(f"d{day}_{i}.jpg", day * 1440 + i * 30, 47.2 + day * 0.1, 11.5)
+                e.timestamp = f"{date}T{8 + i:02d}:00:00"
+                e.selected, e.place = True, ["Innsbruck", "Kitzbuehel"][day]
+                e.width, e.height = 4000, 3000
+                e.quality_score = 0.5 + i * 0.1
+                entries.append(e)
+        return Timeline(entries)
+
+    def test_one_card_opens_each_day(self):
+        tl = self._timeline()
+        plan = NarrativePlan(ordered_clips=[e.filepath for e in tl.selected],
+                             day_titles={"2026-02-25": "Everything uphill, obviously"})
+        shots = assemble.plan_shots(tl, plan, self.cfg, map_tracks=None)
+        days = [s for s in shots if s.kind == "day"]
+        assert len(days) == 2
+        assert days[0].eyebrow == "DAY 1" and days[1].eyebrow == "DAY 2"
+        assert days[0].caption == "Everything uphill, obviously"
+        assert shots.index(days[0]) == 0                      # opens the film
+        assert shots.index(days[1]) < len(shots) - 1
+
+    def test_day_without_a_title_falls_back_to_the_date(self):
+        tl = self._timeline()
+        shots = assemble.plan_shots(tl, NarrativePlan(
+            ordered_clips=[e.filepath for e in tl.selected]), self.cfg, map_tracks=None)
+        assert [s for s in shots if s.kind == "day"][0].caption == "Wed 25 Feb"
+
+    def test_hero_prefers_a_good_landscape_photo(self):
+        tl = self._timeline()
+        day_one = [e for e in tl.selected if e.timestamp.startswith("2026-02-25")]
+        day_one[0].width, day_one[0].height = 3024, 4032     # portrait, best score
+        day_one[0].quality_score = 0.99
+        hero = assemble.hero_for(day_one)
+        assert not assemble.is_portrait(hero)
+        assert hero is max([e for e in day_one if not assemble.is_portrait(e)],
+                           key=lambda e: e.quality_score)
+
+    def test_closing_card_carries_the_quote_and_a_summary(self):
+        tl = self._timeline()
+        plan = NarrativePlan(ordered_clips=[e.filepath for e in tl.selected],
+                             closing_quote="We should have stayed a week")
+        shots = assemble.plan_shots(tl, plan, self.cfg, map_tracks=None)
+        last = shots[-1]
+        assert last.kind == "closing"
+        assert last.caption == "We should have stayed a week"
+        assert "2 days" in last.location and "2 places" in last.location
+
+    def test_cards_can_be_switched_off(self):
+        tl = self._timeline()
+        cfg = assemble.AssembleConfig(day_cards=False, closing_card=False)
+        shots = assemble.plan_shots(tl, NarrativePlan(
+            ordered_clips=[e.filepath for e in tl.selected]), cfg, map_tracks=None)
+        assert all(s.kind == "clip" for s in shots)
+        assert len(shots) == len(tl.selected)
+
+    def test_trip_summary_adds_distance_when_there_is_a_route(self):
+        tl = self._timeline()
+        coords = [(47.2, 11.5), (47.3, 11.5)]      # ~11 km apart
+        assert "km" in assemble.trip_summary(tl, coords)
+        assert "km" not in assemble.trip_summary(tl, None)
+
+
+class TestEntranceAnimation:
+    def test_picture_rises_then_drifts(self, tmp_path):
+        import numpy as np
+        from PIL import Image
+
+        path = tmp_path / "shot.jpg"
+        Image.new("RGB", (1200, 900), (40, 120, 200)).save(path)
+        e = TimelineEntry(filepath=str(path), type="photo")
+        e.width, e.height = 1200, 900
+        cfg = assemble.AssembleConfig(map_mode="none", resolution=(640, 360))
+        clip = assemble.build_clip(e, 3.0, (640, 360), cfg, lambda layout: [], animate=True)
+
+        def card_width(t):
+            frame = np.asarray(clip.get_frame(t), dtype=float).mean(axis=2)
+            edge = np.abs(np.diff(frame, axis=1)).sum(axis=0)
+            cols = np.where(edge > edge.max() * 0.25)[0]
+            return cols.max() - cols.min()
+
+        entering, settled, leaving = card_width(0.0), card_width(1.5), card_width(2.95)
+        assert entering < settled          # rises from behind
+        assert leaving > settled           # drifts past on the way out
+        assert clip.duration == pytest.approx(3.0)
+
+    def test_animation_can_be_switched_off(self, tmp_path):
+        from PIL import Image
+        path = tmp_path / "shot.jpg"
+        Image.new("RGB", (1200, 900), (40, 120, 200)).save(path)
+        e = TimelineEntry(filepath=str(path), type="photo")
+        e.width, e.height = 1200, 900
+        cfg = assemble.AssembleConfig(map_mode="none", resolution=(320, 180))
+        still = assemble.build_clip(e, 2.0, (320, 180), cfg, lambda layout: [], animate=False)
+        import numpy as np
+        assert np.array_equal(still.get_frame(0.1), still.get_frame(1.5))   # nothing moves
+
+
+class TestFlyingMapSurvivesFlattening:
+    """A still photo is flattened to one frame - the moving map must not be
+    flattened away with it."""
+
+    def test_animated_map_is_composited_over_a_photo(self, tmp_path):
+        import numpy as np
+        from PIL import Image
+        import map_render
+
+        photo = tmp_path / "shot.jpg"
+        Image.new("RGB", (1200, 900), (20, 20, 20)).save(photo)
+        frames = []
+        for i in range(4):
+            path = tmp_path / f"m{i}.png"
+            Image.new("RGBA", (600, 600), (255, 80, 0, 255)).save(path)
+            frames.append(path)
+        track = map_render.MapTrack(frames, 12.0, True, [1.0, 1.2, 1.4, 1.0])
+
+        e = TimelineEntry(filepath=str(photo), type="photo")
+        e.width, e.height = 1200, 900
+        cfg = assemble.AssembleConfig(resolution=(640, 360), map_mode="overlay")
+        clip = assemble.build_clip(
+            e, 2.0, (640, 360), cfg, lambda layout: [],
+            overlay_clips_for=lambda layout: [
+                assemble.map_animation_clip(track, layout, cfg, 2.0)],
+            animate=False)
+        frame = np.asarray(clip.get_frame(0.5), dtype=int)
+        layout = assemble.layout_for((1200, 900), (640, 360), cfg)
+        patch = frame[layout.ui_top + 5:layout.ui_top + 30, layout.ui_left + 5:layout.ui_left + 30]
+        assert patch[..., 0].mean() > 150 and patch[..., 2].mean() < 90   # the orange map is there
+
+
+class TestTextNeverOverflows:
+    cfg = assemble.AssembleConfig()
+
+    def _draw(self):
+        from PIL import Image, ImageDraw
+        return ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+
+    def test_long_text_shrinks_instead_of_being_cut(self):
+        draw = self._draw()
+        text = "Everything uphill obviously and then quite a lot more uphill after that"
+        big, big_lines = assemble.fit_text(text, 600, 3, draw, 60, 20)
+        assert len(big_lines) <= 3
+        assert " ".join(big_lines) == text            # nothing lost
+        assert all(draw.textlength(line, font=big) <= 600 for line in big_lines)
+
+    def test_impossible_text_is_ellipsized_not_overflowed(self):
+        draw = self._draw()
+        text = "Supercalifragilistic" * 12
+        font, lines = assemble.fit_text(text, 200, 2, draw, 40, 18)
+        assert lines and all(draw.textlength(line, font=font) <= 200 for line in lines)
+        assert lines[-1].endswith("…")
+
+    def test_short_text_keeps_its_size(self):
+        draw = self._draw()
+        font, lines = assemble.fit_text("Short one", 900, 3, draw, 60, 20)
+        assert lines == ["Short one"] and font.size == 60
+
+    @pytest.mark.parametrize("title", [
+        "Short one",
+        "Everything uphill, obviously",
+        "Everything uphill obviously and then quite a lot more uphill after that",
+    ])
+    def test_day_card_stack_stays_inside_the_frame(self, title):
+        shot = assemble.Shot(entry=entry("a.jpg"), duration=4.0, caption=title,
+                             location="Fri 27 Feb · Hopfgarten im Brixental",
+                             eyebrow="DAY 3", kind="day")
+        frame = (1920, 1080)
+        margin = round(self.cfg.frame_margin * 1920)
+        sizes = [(4000, 3000), (3024, 4032), (4000, 3000)]
+        probe = assemble.day_card_layout(sizes, frame, self.cfg)
+        height = assemble.day_card_text_height(shot, probe["text_width"], frame, self.cfg)
+        geometry = assemble.day_card_layout(sizes, frame, self.cfg, height)
+
+        row_x, row_y, row_w, row_h = geometry["row"]
+        map_x, map_y, map_w, _ = geometry["map"]
+        assert row_y >= margin and row_x >= margin
+        assert row_x + row_w <= 1920 - margin
+        assert map_y + map_w <= 1080 - margin          # the map still fits under the text
+        assert map_y >= geometry["text_top"] + height  # and never lands on it
+
+    def test_day_card_text_is_centred(self):
+        shot = assemble.Shot(entry=entry("a.jpg"), duration=4.0, eyebrow="DAY 2",
+                             caption="Everything uphill, obviously",
+                             location="Thu 26 Feb", kind="day")
+        frame = (1280, 720)
+        geometry = assemble.day_card_layout([(4000, 3000)], frame, self.cfg)
+        overlay = assemble.day_card_text(shot, geometry, frame, self.cfg)
+        pixels = overlay.load()
+        inked = [x for x in range(1280)
+                 if any(pixels[x, y][3] > 0 for y in range(geometry["text_top"], 720))]
+        left, right = min(inked), max(inked)
+        assert abs((left + right) / 2 - 640) < 12       # balanced about the centre line
+
+
+class TestClosingCard:
+    cfg = assemble.AssembleConfig()
+
+    def test_map_is_the_hero_and_corners_hold_photos(self, tmp_path):
+        import numpy as np
+        from PIL import Image
+
+        photos = []
+        for i, colour in enumerate([(220, 40, 40), (40, 220, 40), (40, 40, 220), (220, 220, 40)]):
+            path = tmp_path / f"c{i}.jpg"
+            Image.new("RGB", (1200, 900), colour).save(path)
+            e = TimelineEntry(filepath=str(path), type="photo")
+            e.width, e.height = 1200, 900
+            photos.append(e)
+        map_path = tmp_path / "map.png"
+        Image.new("RGBA", (700, 700), (250, 250, 250, 255)).save(map_path)
+
+        shot = assemble.Shot(entry=photos[0], duration=6.0, kind="closing",
+                             caption="Austria doesn't ask for much, just your knees",
+                             location="6 days · 6 places · 177 km",
+                             map_still=map_path, gallery=photos)
+        clip = assemble.build_closing_card(shot, (1280, 720), self.cfg, animate=False)
+        frame = np.asarray(clip.get_frame(1.0), dtype=int)
+
+        centre = frame[150:420, 500:780]
+        assert centre.mean() > 180                     # the big pale map dominates the middle
+        margin = round(self.cfg.frame_margin * 1280)
+        for x, y in [(margin + 20, margin + 20), (1280 - margin - 20, margin + 20),
+                     (margin + 20, 720 - margin - 20), (1280 - margin - 20, 720 - margin - 20)]:
+            patch = frame[y - 8:y + 8, x - 8:x + 8]
+            assert patch.std() > 0 or patch.mean() > 20   # a photo sits in every corner
+
+    def test_quote_and_stats_are_drawn_and_fit(self, tmp_path):
+        import numpy as np
+        from PIL import Image
+        path = tmp_path / "a.jpg"
+        Image.new("RGB", (1200, 900), (10, 10, 10)).save(path)
+        e = TimelineEntry(filepath=str(path), type="photo")
+        e.width, e.height = 1200, 900
+        shot = assemble.Shot(entry=e, duration=6.0, kind="closing", gallery=[e],
+                             caption="A closing line that runs on considerably longer than usual",
+                             location="6 days · 6 places · 177 km")
+        clip = assemble.build_closing_card(shot, (1280, 720), self.cfg, animate=False)
+        frame = np.asarray(clip.get_frame(1.0), dtype=float).mean(axis=2)
+        margin = round(self.cfg.frame_margin * 1280)
+        bright = frame > 200
+        cols = np.where(bright.any(axis=0))[0]
+        rows = np.where(bright.any(axis=1))[0]
+        assert cols.min() >= margin - 2 and cols.max() <= 1280 - margin + 2
+        assert rows.max() <= 720 - margin + 2          # nothing runs off the bottom
+
+
+class TestKeepAllVideos:
+    """--all-videos: everything shot as video makes the cut."""
+
+    def _clips(self):
+        short = entry("brief.mp4", 0, 46.0, 7.7, kind="video", duration=0.9)
+        twin_a = entry("clip.mp4", 5, 46.0, 7.7, kind="video", duration=8.0)
+        twin_b = entry("clip+1.mp4", 5, 46.0, 7.7, kind="video", duration=8.0)
+        photo = entry("still.jpg", 9, 46.0, 7.7)
+        for e in (short, twin_a, twin_b, photo):
+            e.blur_score, e.brightness = 400.0, 128.0
+        return [short, twin_a, twin_b, photo]
+
+    def test_short_videos_survive_the_quality_gate(self, tmp_path):
+        path = tmp_path / "v.mp4"
+        e = entry("v.mp4", kind="video", duration=0.8)
+        e.filepath = str(path)
+        selection.score_entry(e, selection.SelectionConfig(keep_all_videos=True))
+        assert e.drop_reason != "video shorter than 2s"
+
+        strict = entry("v.mp4", kind="video", duration=0.8)
+        selection.score_entry(strict, selection.SelectionConfig())
+        assert "shorter than" in strict.drop_reason
+
+    def test_duplicate_videos_are_kept(self, monkeypatch):
+        import numpy as np
+        clips = self._clips()[1:3]
+        monkeypatch.setattr(selection, "clip_embeddings",
+                            lambda *a, **kw: np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32))
+        kept = selection.deduplicate(list(clips), selection.SelectionConfig(keep_all_videos=True))
+        assert len(kept) == 2
+        collapsed = selection.deduplicate(list(clips), selection.SelectionConfig())
+        assert len(collapsed) == 1
+
+    def test_all_videos_can_exceed_max_clips(self):
+        videos = [entry(f"v{i}.mp4", i, 46.0, 7.7, kind="video", duration=5.0) for i in range(8)]
+        cfg = selection.SelectionConfig(max_clips=3, keep_all_videos=True)
+        chosen = selection.balanced_select(videos, cfg)
+        assert len(chosen) == 8
+        capped = selection.balanced_select(videos, selection.SelectionConfig(max_clips=3))
+        assert len(capped) == 3
+
+
+class TestMultipleSongs:
+    def test_accepts_a_file_a_list_and_a_folder(self, tmp_path):
+        first, second = tmp_path / "a.mp3", tmp_path / "b.mp3"
+        for path in (first, second):
+            path.write_bytes(b"x")
+        (tmp_path / "notes.txt").write_text("not music")
+        assert assemble.music_files(str(first)) == [str(first)]
+        assert assemble.music_files([str(first), str(second)]) == [str(first), str(second)]
+        assert assemble.music_files([str(tmp_path)]) == [str(first), str(second)]   # name order
+        assert assemble.music_files(["/nope/missing.mp3"]) == []
+
+    def test_songs_are_levelled_and_joined(self, tmp_path):
+        import subprocess
+        import numpy as np
+
+        loud, quiet = tmp_path / "loud.mp3", tmp_path / "quiet.mp3"
+        for path, gain in ((loud, "0.9"), (quiet, "0.12")):
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                            "sine=frequency=330:duration=12", "-af", f"volume={gain}",
+                            "-c:a", "libmp3lame", str(path)], check=True)
+
+        levels = [mediautil.measure_audio(str(p))["mean_db"] for p in (loud, quiet)]
+        assert abs(levels[0] - levels[1]) > 10          # the files really are far apart
+
+        bed, _ = assemble.build_music_bed([str(loud), str(quiet)], 20.0, assemble.AssembleConfig())
+        assert bed.duration == pytest.approx(20.0, abs=0.1)
+        arr = bed.to_soundarray(fps=22050)
+
+        def level(start, end):
+            window = arr[int(start * 22050):int(end * 22050)]
+            return 20 * np.log10(max(float(np.sqrt((window ** 2).mean())), 1e-9))
+
+        assert level(2, 8) == pytest.approx(level(14, 19), abs=2.0)   # matched in the mix
+
+    def test_a_missing_track_is_skipped_not_fatal(self, tiny_music):
+        bed, _ = assemble.build_music_bed([tiny_music], 8.0, assemble.AssembleConfig())
+        assert bed is not None and bed.duration == pytest.approx(8.0, abs=0.1)
+
+
+class TestTargetDuration:
+    cfg_base = dict(photo_duration=3.5, crossfade=0.5, day_cards=False, closing_card=False)
+
+    def _shots(self, photos=8, videos=2):
+        shots = []
+        for i in range(photos):
+            shots.append(assemble.Shot(entry=entry(f"p{i}.jpg", i), duration=3.5))
+        for i in range(videos):
+            e = entry(f"v{i}.mp4", 100 + i, kind="video", duration=6.0)
+            shots.append(assemble.Shot(entry=e, duration=6.0))
+        return shots
+
+    def _length(self, shots, cfg):
+        overlap = cfg.crossfade * max(0, sum(1 for s in shots[1:] if s.transition == "crossfade"))
+        return sum(s.duration for s in shots) - overlap
+
+    @pytest.mark.parametrize("target", [45.0, 60.0, 75.0])
+    def test_lands_on_the_requested_length(self, target):
+        cfg = assemble.AssembleConfig(target_duration=target, **self.cfg_base)
+        shots = self._shots()
+        assemble.fit_to_duration(shots, cfg)
+        assert self._length(shots, cfg) == pytest.approx(target, abs=0.05)
+
+    def test_videos_keep_their_own_length(self):
+        cfg = assemble.AssembleConfig(target_duration=45.0, **self.cfg_base)
+        shots = self._shots()
+        assemble.fit_to_duration(shots, cfg)
+        assert all(s.duration == 6.0 for s in shots if s.entry.is_video)
+
+    def test_too_short_a_target_clamps_rather_than_flashing_frames(self):
+        cfg = assemble.AssembleConfig(target_duration=8.0, **self.cfg_base)
+        shots = self._shots()
+        used = assemble.fit_to_duration(shots, cfg)
+        assert used == cfg.min_photo_duration            # as short as it will go
+        assert all(s.duration >= cfg.min_photo_duration for s in shots if not s.entry.is_video)
+
+    def test_too_long_a_target_stops_at_a_watchable_still(self, caplog):
+        # 8 photos cannot fill 90s without ~10s stills, so it stops at the cap
+        cfg = assemble.AssembleConfig(target_duration=90.0, **self.cfg_base)
+        shots = self._shots()
+        with caplog.at_level("WARNING"):
+            used = assemble.fit_to_duration(shots, cfg)
+        assert used == cfg.max_photo_duration
+        assert "cannot reach" in caplog.text
+        assert self._length(shots, cfg) < 90.0
+
+    def test_without_a_target_nothing_changes(self):
+        cfg = assemble.AssembleConfig(**self.cfg_base)
+        shots = self._shots()
+        assert assemble.fit_to_duration(shots, cfg) == 3.5
+        assert all(s.duration in (3.5, 6.0) for s in shots)
+
+    def test_duration_parsing(self):
+        import main
+        assert main.parse_duration("3m30s") == 210.0
+        assert main.parse_duration("3.5m") == 210.0
+        assert main.parse_duration("210") == 210.0
+        with pytest.raises(SystemExit):
+            main.parse_duration("ages")
+        with pytest.raises(SystemExit):
+            main.parse_duration("2")            # under the 5 second floor
+
+
+class TestMusicAnalysis:
+    """Beat tracking on a click track with a known tempo."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def click_track(cls, tmp_path_factory):
+        import subprocess
+        path = tmp_path_factory.mktemp("beats") / "click.wav"
+        # 120 BPM: a click every 0.5 s, with a loud second half
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "sine=frequency=1000:duration=24",
+            "-f", "lavfi", "-i", "sine=frequency=2:duration=24",
+            "-filter_complex",
+            "[1]aeval=0.5*(1-cos(2*PI*t*2)):c=mono[env];[0][env]amultiply,"
+            "volume='if(gt(t,12),1.0,0.25)':eval=frame",
+            "-ar", "22050", str(path)], check=True)
+        return str(path)
+
+    def test_finds_the_tempo_and_beats(self, click_track):
+        import music
+        analysed = music.analyse([click_track])
+        assert analysed is not None
+        assert analysed.tempo == pytest.approx(120, rel=0.12)
+        assert len(analysed.beats) > 20
+        gaps = np.diff(analysed.beats)
+        assert float(np.median(gaps)) == pytest.approx(0.5, abs=0.06)
+
+    def test_energy_follows_the_track(self, click_track):
+        import music
+        analysed = music.analyse([click_track])
+        assert analysed.energy_at(4.0) < analysed.energy_at(18.0)   # quiet half, loud half
+        assert 0.0 <= analysed.busy_threshold() <= 1.0
+
+    def test_analysis_is_cached_per_track(self, click_track, tmp_path):
+        import music
+        cache = tmp_path / "music.json"
+        first = music.analyse([click_track], cache)
+        assert cache.exists()
+        again = music.analyse([click_track], cache)
+        assert again.beats == [round(b, 3) for b in first.beats]   # cached to the millisecond
+        assert music.MusicMap.load_if_matching(cache, ["/other/song.mp3"]) is None
+
+    def test_missing_or_broken_audio_is_not_fatal(self, tmp_path):
+        import music
+        assert music.analyse([]) is None
+        broken = tmp_path / "broken.mp3"
+        broken.write_bytes(b"not audio at all")
+        assert music.analyse([str(broken)]) is None
+
+    def test_nearest_beat_respects_the_tolerance(self):
+        import music
+        grid = music.MusicMap(tempo=120.0, beats=[0.0, 0.5, 1.0, 1.5, 2.0])
+        assert grid.nearest_beat(1.04, 0.1) == 1.0
+        assert grid.nearest_beat(1.25, 0.1) is None          # too far from either
+        assert grid.beat_interval == pytest.approx(0.5)
+
+    def test_pacing_is_shorter_when_the_music_is_busy(self):
+        import music
+        m = music.MusicMap(tempo=120.0, beats=[0.0], energy_times=[0.0, 10.0], energy=[0.1, 0.95])
+        assert music.pacing_factor(m, 0.0, 1.0) > 1.0        # quiet: linger
+        assert music.pacing_factor(m, 10.0, 1.0) < 1.0       # busy: move on
+        assert music.pacing_factor(m, 10.0, 0.0) == pytest.approx(1.0)   # strength 0 = off
+
+
+class TestBeatSync:
+    def _music(self, bpm=120.0, length=120.0):
+        import music
+        step = 60.0 / bpm
+        beats = [round(i * step, 3) for i in range(int(length / step))]
+        times = [i * 0.5 for i in range(int(length * 2))]
+        return music.MusicMap(duration=length, tempo=bpm, beats=beats,
+                              downbeats=beats[::4], energy_times=times,
+                              energy=[0.5] * len(times))
+
+    def _shots(self, count=10):
+        return [assemble.Shot(entry=entry(f"p{i}.jpg", i), duration=3.3) for i in range(count)]
+
+    def _cuts(self, shots, cfg):
+        t, cuts = 0.0, []
+        for i, shot in enumerate(shots):
+            nxt = shots[i + 1] if i + 1 < len(shots) else None
+            overlap = cfg.crossfade if (nxt and nxt.transition == "crossfade") else 0.0
+            t += shot.duration - overlap
+            cuts.append(t)
+        return cuts
+
+    def test_cuts_move_onto_the_beat(self):
+        cfg = assemble.AssembleConfig(beat_sync=True, beat_sync_strength=0.0)
+        shots, music_map = self._shots(), self._music()
+        assemble.sync_to_music(shots, music_map, cfg)
+        offsets = [min(abs(c - b) for b in music_map.beats) for c in self._cuts(shots, cfg)[:-1]]
+        assert max(offsets) < 0.05
+
+    def test_it_does_not_run_away_with_the_length(self):
+        # worst case: identical shot lengths, so every snap rounds the same way
+        cfg = assemble.AssembleConfig(beat_sync=True, beat_sync_strength=0.6)
+        shots = self._shots(12)
+        before = self._cuts(shots, cfg)[-1]
+        assemble.sync_to_music(shots, self._music(), cfg)
+        assert self._cuts(shots, cfg)[-1] == pytest.approx(before, rel=0.08)
+
+    def test_transitions_are_decided_before_the_length_is_fitted(self):
+        cfg = assemble.AssembleConfig(beat_sync=True, beat_sync_strength=0.0,
+                                      target_duration=40.0, day_cards=False,
+                                      closing_card=False)
+        shots = self._shots(10)
+        loud = self._music()
+        loud.energy = [0.95] * len(loud.energy_times)      # every join is a busy one
+        assemble.choose_transitions(shots, loud, cfg)
+        assert all(s.transition == "cut" for s in shots[1:])
+        assemble.fit_to_duration(shots, cfg)
+        # with no crossfades there are no overlaps to subtract, and the fit knows it
+        assert sum(s.duration for s in shots) == pytest.approx(40.0, abs=0.05)
+
+    def test_videos_are_trimmed_to_a_beat_never_stretched(self):
+        cfg = assemble.AssembleConfig(beat_sync=True, beat_sync_strength=0.0)
+        video = entry("v.mp4", 0, kind="video", duration=7.0)
+        shots = [assemble.Shot(entry=video, duration=7.0),
+                 assemble.Shot(entry=entry("p.jpg", 1), duration=3.3)]
+        assemble.sync_to_music(shots, self._music(), cfg)
+        assert shots[0].duration <= 7.0
+
+    def test_a_drop_becomes_a_hard_cut_with_a_punch(self):
+        cfg = assemble.AssembleConfig(beat_sync=True, beat_sync_strength=0.0)
+        shots = self._shots(4)
+        m = self._music()
+        m.drops = [self._cuts(shots, cfg)[0]]       # a drop right on the first cut
+        assemble.choose_transitions(shots, m, cfg)
+        assert shots[1].transition == "cut" and shots[1].punch is True
+
+    def test_switching_it_off_changes_nothing(self):
+        cfg = assemble.AssembleConfig(beat_sync=False)
+        shots = self._shots()
+        assert assemble.sync_to_music(shots, self._music(), cfg) == 0
+        assert all(s.duration == 3.3 for s in shots)
+
+    def test_no_music_map_is_harmless(self):
+        cfg = assemble.AssembleConfig(beat_sync=True)
+        shots = self._shots()
+        assert assemble.sync_to_music(shots, None, cfg) == 0
+
+
+class TestVideoHighlights:
+    """Long videos should give up their best moments, not their first ones."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def marked_video(cls, tmp_path_factory):
+        """20 s where each second is a distinct, identifiable brightness, and
+        the interesting action (movement + sound) sits at 12-16 s."""
+        import subprocess
+        path = tmp_path_factory.mktemp("video") / "marked.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "color=c=gray:s=320x180:d=20:r=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+            "-filter_complex",
+            # brightness encodes the second; a burst of noise at 12-16s
+            "[0]geq=lum='if(between(T,12,16),128+100*sin(40*T+X/9),8*floor(T))':cb=128:cr=128[v];"
+            "[1]volume='if(between(t,12,16),1.0,0.02)':eval=frame[a]",
+            "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", str(path)], check=True)
+        return str(path)
+
+    def test_the_interesting_part_is_chosen(self, marked_video):
+        import highlights
+        cfg = highlights.HighlightConfig(budget=6.0, min_segment=3.0, max_segments=1)
+        picked = highlights.highlights_for(marked_video, 20.0, cfg)
+        assert len(picked) == 1
+        start, end = picked[0]
+        assert end - start == pytest.approx(6.0, abs=0.6)
+        assert 9.0 <= start <= 14.0        # lands on the burst at 12-16s, not at 0
+
+    def test_a_short_video_is_used_whole(self, marked_video):
+        import highlights
+        cfg = highlights.HighlightConfig(budget=30.0)
+        assert highlights.highlights_for(marked_video, 20.0, cfg) == [(0.0, 20.0)]
+
+    def test_speech_lifts_the_score_where_someone_talks(self, marked_video):
+        import highlights
+        times, plain = highlights.score_video(marked_video)
+        _, spoken = highlights.score_video(marked_video, [{"start": 2.0, "end": 5.0}])
+        window = (times >= 2.0) & (times <= 5.0)
+        # the bonus is smoothed over ~1.5 s, so the mean rises by less than it
+        assert spoken[window].mean() > plain[window].mean() + 0.1
+        assert spoken[window].max() > plain[window].max() + 0.3
+        outside = times > 17.0
+        assert spoken[outside].mean() == pytest.approx(plain[outside].mean(), abs=0.01)
+
+    def test_a_quiet_word_does_not_beat_a_loud_scene(self, marked_video):
+        # speech helps, but it should not drag the pick off an obvious burst
+        import highlights
+        cfg = highlights.HighlightConfig(budget=6.0, min_segment=3.0, max_segments=1)
+        picked = highlights.highlights_for(marked_video, 20.0, cfg, [{"start": 2.0, "end": 5.0}])
+        assert 9.0 <= picked[0][0] <= 14.0
+
+    def test_budget_is_respected_across_segments(self):
+        import highlights
+        times = np.arange(0, 60, 0.5)
+        score = np.zeros_like(times)
+        for peak in (5.0, 25.0, 45.0):     # three separate moments
+            score[(times > peak - 2) & (times < peak + 2)] = 1.0
+        cfg = highlights.HighlightConfig(budget=9.0, min_segment=3.0, max_segments=3)
+        picked = highlights.pick_segments(times, score, 60.0, cfg)
+        assert 1 <= len(picked) <= 3
+        assert sum(e - s for s, e in picked) <= 9.0 + 1e-6
+        assert picked == sorted(picked)                       # chronological
+        for (_, end), (start, _) in zip(picked, picked[1:]):
+            assert start >= end                               # never overlapping
+
+    def test_assembly_plays_the_chosen_stretches(self, marked_video):
+        src = __import__("moviepy").VideoFileClip(marked_video, audio=False)
+        try:
+            joined = assemble._joined_segments(src, [(2.0, 5.0), (14.0, 17.0)], 6.0)
+            assert joined.duration == pytest.approx(6.0, abs=0.2)
+
+            def brightness(clip, t):
+                return float(np.asarray(clip.get_frame(t), dtype=float).mean())
+
+            # first stretch plays seconds 2-5, second stretch seconds 14-17
+            assert brightness(joined, 0.5) == pytest.approx(brightness(src, 2.5), abs=2.0)
+            assert brightness(joined, 4.5) == pytest.approx(brightness(src, 15.5), abs=6.0)
+            assert brightness(joined, 4.5) != pytest.approx(brightness(src, 4.5), abs=6.0)
+        finally:
+            src.close()
+
+    def test_segments_drive_the_clip_length(self):
+        e = entry("v.mp4", kind="video", duration=90.0)
+        cfg = assemble.AssembleConfig(max_video_duration=15.0)
+        assert assemble.clip_duration(e, cfg) == 15.0        # no scan: opening 15s
+        assert assemble.video_segments(e, cfg) == [(0.0, 15.0)]
+
+        e.extra["highlights"] = [[10.0, 15.0], [60.0, 66.0]]
+        assert assemble.video_segments(e, cfg) == [(10.0, 15.0), (60.0, 66.0)]
+        assert assemble.clip_duration(e, cfg) == pytest.approx(11.0)
+
+    def test_a_cached_scan_still_respects_a_smaller_budget(self):
+        e = entry("v.mp4", kind="video", duration=90.0)
+        e.extra["highlights"] = [[10.0, 20.0], [60.0, 70.0]]
+        cfg = assemble.AssembleConfig(max_video_duration=12.0)
+        assert assemble.clip_duration(e, cfg) == pytest.approx(12.0)
+
+    def test_highlights_can_be_switched_off(self):
+        e = entry("v.mp4", kind="video", duration=90.0)
+        e.extra["highlights"] = [[60.0, 70.0]]
+        cfg = assemble.AssembleConfig(max_video_duration=15.0, use_highlights=False)
+        assert assemble.video_segments(e, cfg) == [(0.0, 15.0)]
+
+
+class TestAwkwardContainers:
+    """iPhone MOVs carry data streams MoviePy's parser refuses."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def mov_with_data_streams(cls, tmp_path_factory):
+        import subprocess
+        base = tmp_path_factory.mktemp("mov")
+        plain, tricky = base / "plain.mov", base / "tricky.mov"
+        subprocess.run(["ffmpeg", "-y", "-v", "error",
+                        "-f", "lavfi", "-i", "testsrc=size=320x180:rate=15:duration=3",
+                        "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                        "-shortest", str(plain)], check=True)
+        # add a timecode data stream, like a phone does
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(plain),
+                        "-map", "0", "-c", "copy", "-timecode", "01:02:03:04",
+                        str(tricky)], check=True)
+        return str(plain), str(tricky)
+
+    def test_a_normal_file_is_passed_straight_through(self, mov_with_data_streams, tmp_path):
+        plain, _ = mov_with_data_streams
+        assert mediautil.playable_video(plain, tmp_path) == plain    # no copy made
+        assert not list(Path(tmp_path).glob("*.mp4"))
+
+    def test_an_unopenable_file_is_remuxed_and_then_opens(self, tmp_path):
+        from moviepy import VideoFileClip
+
+        # a file MoviePy cannot parse, standing in for the phone containers
+        broken = tmp_path / "broken.mov"
+        broken.write_bytes(b"\x00" * 2048)
+        assert mediautil.playable_video(broken, tmp_path / "remux") is None   # nothing to rescue
+
+        import subprocess
+        real = tmp_path / "real.mov"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=160x120:rate=10:duration=2",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(real)], check=True)
+        mediautil._PLAYABLE.clear()
+        path = mediautil.playable_video(real, tmp_path / "remux")
+        clip = VideoFileClip(path, audio=False)
+        try:
+            assert clip.duration == pytest.approx(2.0, abs=0.2)
+        finally:
+            clip.close()
+
+    def test_the_decision_is_memoised(self, mov_with_data_streams, tmp_path):
+        plain, _ = mov_with_data_streams
+        mediautil._PLAYABLE.clear()
+        first = mediautil.playable_video(plain, tmp_path)
+        assert str(Path(plain).resolve()) in mediautil._PLAYABLE
+        assert mediautil.playable_video(plain, tmp_path) == first
+
+    def test_remuxing_keeps_orientation_and_length(self, tmp_path):
+        import subprocess
+        from moviepy import VideoFileClip
+
+        portrait = tmp_path / "portrait.mov"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=180x320:rate=10:duration=2.5",
+                        "-f", "lavfi", "-i", "sine=frequency=300:duration=2.5",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                        "-shortest", str(portrait)], check=True)
+        mediautil._PLAYABLE.clear()
+        path = mediautil.playable_video(portrait, tmp_path / "remux")
+        clip = VideoFileClip(path)
+        try:
+            assert clip.size == [180, 320]                  # still portrait
+            assert clip.duration == pytest.approx(2.5, abs=0.2)
+            assert clip.audio is not None                   # audio survived
+        finally:
+            clip.close()
+
+
+class TestBuildClipIntegration:
+    """Through `build_clip` itself, not its helpers.
+
+    These exist because two patches to the video branch were once silently
+    skipped: the helpers were tested directly and passed, while the picture
+    still played the opening seconds and unreadable containers were dropped.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def marked_clip(cls, tmp_path_factory):
+        """8 s where brightness encodes the second, plus data streams."""
+        import subprocess
+        base = tmp_path_factory.mktemp("integration")
+        plain, tricky = base / "plain.mp4", base / "tricky.mov"
+        subprocess.run(["ffmpeg", "-y", "-v", "error",
+                        "-f", "lavfi", "-i", "color=c=gray:s=320x180:d=8:r=10",
+                        "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+                        "-filter_complex", "[0]geq=lum='24*floor(T)':cb=128:cr=128[v]",
+                        "-map", "[v]", "-map", "1:a", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", str(plain)], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(plain), "-map", "0",
+                        "-c", "copy", "-timecode", "01:00:00:00", str(tricky)], check=True)
+        return str(plain), str(tricky)
+
+    def _entry(self, path, duration=8.0):
+        e = TimelineEntry(filepath=str(path), type="video")
+        e.width, e.height, e.duration = 320, 180, duration
+        return e
+
+    def test_the_picture_plays_the_highlight_stretch(self, marked_clip, tmp_path):
+        plain, _ = marked_clip
+        e = self._entry(plain)
+        e.extra["highlights"] = [[5.0, 8.0]]          # brightness ~120-168 there
+        cfg = assemble.AssembleConfig(resolution=(320, 180), map_mode="none",
+                                      remux_dir=tmp_path / "remux", max_video_duration=15.0)
+        assert assemble.clip_duration(e, cfg) == pytest.approx(3.0)
+
+        clip = assemble.build_clip(e, 3.0, (320, 180), cfg, lambda layout: [], animate=False)
+        card = np.asarray(clip.get_frame(0.5), dtype=float)
+        centre = card[70:110, 130:190].mean()
+
+        opening = self._entry(plain)
+        opening.extra["highlights"] = [[0.0, 3.0]]
+        other = assemble.build_clip(opening, 3.0, (320, 180), cfg, lambda layout: [], animate=False)
+        opening_centre = np.asarray(other.get_frame(0.5), dtype=float)[70:110, 130:190].mean()
+
+        # second 5 is much brighter than second 0 in this clip
+        assert centre > opening_centre + 30
+
+    def test_a_container_moviepy_refuses_is_still_rendered(self, marked_clip, tmp_path):
+        _, tricky = marked_clip
+        mediautil._PLAYABLE.clear()
+        e = self._entry(tricky)
+        cfg = assemble.AssembleConfig(resolution=(320, 180), map_mode="none",
+                                      remux_dir=tmp_path / "remux")
+        clip = assemble.build_clip(e, 2.0, (320, 180), cfg, lambda layout: [], animate=False)
+        assert clip.duration == pytest.approx(2.0)
+        assert np.asarray(clip.get_frame(1.0)).shape == (180, 320, 3)
+
+    def test_heic_photos_render(self, tmp_path):
+        from PIL import Image
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+        path = tmp_path / "shot.heic"
+        try:
+            Image.new("RGB", (1200, 900), (30, 140, 90)).save(path, format="HEIF")
+        except Exception:                      # no HEIF encoder available here
+            pytest.skip("pillow-heif cannot write HEIC in this build")
+        e = TimelineEntry(filepath=str(path), type="photo")
+        e.width, e.height = 1200, 900
+        cfg = assemble.AssembleConfig(resolution=(320, 180), map_mode="none")
+        clip = assemble.build_clip(e, 2.0, (320, 180), cfg, lambda layout: [], animate=False)
+        frame = np.asarray(clip.get_frame(1.0))
+        assert frame.shape == (180, 320, 3)
+        assert frame[:, :, 1].mean() > frame[:, :, 0].mean()      # the green card is there
+
+    def test_picture_and_sound_use_the_same_stretches(self, marked_clip, tmp_path):
+        plain, _ = marked_clip
+        e = self._entry(plain)
+        e.extra["highlights"] = [[2.0, 4.0], [6.0, 8.0]]
+        cfg = assemble.AssembleConfig(resolution=(320, 180), map_mode="none",
+                                      remux_dir=tmp_path / "remux")
+        assert assemble.video_segments(e, cfg) == [(2.0, 4.0), (6.0, 8.0)]
+        assert assemble.clip_duration(e, cfg) == pytest.approx(4.0)
+
+        from moviepy import VideoFileClip
+        source = VideoFileClip(mediautil.playable_video(plain, tmp_path / "remux"))
+        try:
+            audio = assemble._joined_audio(source.audio, assemble.video_segments(e, cfg), 4.0)
+            clip = assemble.build_clip(e, 4.0, (320, 180), cfg, lambda layout: [], animate=False)
+            assert audio.duration == pytest.approx(clip.duration, abs=0.15)
+        finally:
+            source.close()

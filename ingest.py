@@ -70,6 +70,46 @@ def _parse_timestamp(value: Any) -> str | None:
     return dt.isoformat()
 
 
+# Camera and messenger naming conventions that carry the capture time.
+_NAME_PATTERNS = (
+    # 20250910_144855 / IMG_20250910_144855 / VID_... and PXL_20250910_144855123,
+    # where Pixel appends milliseconds
+    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_\-T](\d{2})(\d{2})(\d{2})(?:\d{1,3})?(?!\d)"), "second"),
+    # signal-2025-09-10-144855
+    (re.compile(r"(?<!\d)(20\d{2})[-.](\d{2})[-.](\d{2})[-_](\d{2})(\d{2})(\d{2})(?!\d)"), "second"),
+    # 2025-09-10 14.48.55 / 2025-09-10_14-48-55
+    (re.compile(r"(?<!\d)(20\d{2})[-.](\d{2})[-.](\d{2})[ _T](\d{2})[-.:](\d{2})[-.:](\d{2})(?!\d)"), "second"),
+    # IMG-20260228-WA0003 (WhatsApp) - the day only
+    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), "day"),
+    (re.compile(r"(?<!\d)(20\d{2})-(\d{2})-(\d{2})(?!\d)"), "day"),
+)
+
+
+def timestamp_from_name(name: str) -> tuple[str | None, str | None]:
+    """A capture time read out of the filename, and how precise it is.
+
+    Phones name files after the moment they were taken - `20250910_144855.jpg`
+    on Samsung, `PXL_20250910_144855123` on Pixel, `IMG-20250910-WA0007` from
+    WhatsApp (day only). That is the only timestamp a WhatsApp forward or a
+    stripped export still carries.
+    """
+    stem = Path(name).stem
+    for pattern, precision in _NAME_PATTERNS:
+        match = pattern.search(stem)
+        if not match:
+            continue
+        parts = [int(g) for g in match.groups()]
+        year, month, day = parts[0], parts[1], parts[2]
+        hour, minute, second = (parts[3:6] + [0, 0, 0])[:3] if len(parts) > 3 else (0, 0, 0)
+        try:
+            when = datetime(year, month, day, hour, minute, second)
+        except ValueError:
+            continue
+        if 1990 <= when.year <= 2100:
+            return when.isoformat(), precision
+    return None, None
+
+
 def _valid_gps(lat: Any, lon: Any) -> GPS | None:
     try:
         lat_f, lon_f = float(lat), float(lon)
@@ -481,6 +521,27 @@ def build_entry(path: Path, exif_tags: dict[str, Any] | None = None) -> Timeline
         for key, value in _pillow_info(path).items():
             info.setdefault(key, value)
 
+    # The filename often carries the capture time, and it survives edits and
+    # exports that strip EXIF. Metadata still wins when it has a real date -
+    # it is what the camera recorded - but a filename beats the file's mtime,
+    # which is just when it was last copied.
+    named, precision = timestamp_from_name(path.name)
+    if named:
+        info["filename_time"] = named
+        current, source = info.get("timestamp"), info.get("timestamp_source")
+        if not current or source in (None, "mtime", "ffprobe"):
+            if not current or source != "ffprobe" or precision == "second":
+                info["timestamp"] = named
+                info["timestamp_source"] = "filename"
+        elif precision == "second":
+            try:
+                drift = abs((dateparser.parse(current) - dateparser.parse(named)).total_seconds())
+                if drift > 86400:
+                    log.info("%s: metadata says %s but the name says %s - keeping the metadata",
+                             path.name, current[:16], named[:16])
+            except (ValueError, TypeError):
+                pass
+
     if not info.get("timestamp"):
         try:
             info["timestamp"] = _parse_timestamp(path.stat().st_mtime)
@@ -504,6 +565,7 @@ def build_entry(path: Path, exif_tags: dict[str, Any] | None = None) -> Timeline
         camera=info.get("camera"),
         altitude=info.get("altitude"),
         timestamp_source=info.get("timestamp_source"),
+        extra={"filename_time": info["filename_time"]} if info.get("filename_time") else {},
     )
 
 

@@ -43,7 +43,9 @@ Return ONLY a single JSON object - no markdown fences, no commentary - with exac
   "captions": {"<clip id>": "<caption>"},
   "transition_hints": {"<clip id>": "crossfade" | "cut" | "fadein"},
   "chapter_markers": [{"at_clip": <index into ordered_clips>, "title": "<2-3 words>"}],
-  "mood": "<a few words describing the overall feel>"
+  "mood": "<a few words describing the overall feel>",
+  "day_titles": {"<YYYY-MM-DD>": "<title for that whole day>"},
+  "closing_quote": "<the line the film ends on>"
 }
 
 Rules:
@@ -68,6 +70,13 @@ Rules:
   place name when there is one; these are only a fallback, since the video already labels
   locations from GPS.
 - mood: a short phrase, e.g. "uplifting mountain adventure".
+- day_titles: one for EVERY date listed below, in the same dry, funny voice as the
+  captions. It titles the whole day, so it should catch that day's arc or its running
+  joke rather than any single clip - what someone would say about the day afterwards.
+  Maximum 5 words, no final period, no emoji, no "Day 1" prefix (the film adds that).
+  Good: "Everything uphill, obviously", "The day of the fog", "Nobody packed enough socks".
+- closing_quote: the line the film ends on, over the last shot. Warm rather than
+  punchy - the one that makes them want to go back. Maximum 9 words, no attribution.
 """
 
 CAPTION_TARGET_RULE = """
@@ -132,6 +141,41 @@ def _clip_payload(timeline: Timeline) -> tuple[list[dict[str, Any]], dict[str, T
             item["speech"] = e.transcript[:300]
         payload.append(item)
     return payload, lookup
+
+
+def day_key(entry) -> str | None:
+    """The calendar date a clip belongs to, as YYYY-MM-DD."""
+    if not entry.timestamp:
+        return None
+    return str(entry.timestamp)[:10]
+
+
+def trip_days(timeline: Timeline) -> list[str]:
+    """Every date the selected clips fall on, in order."""
+    seen = []
+    for entry in timeline.selected:
+        key = day_key(entry)
+        if key and key not in seen:
+            seen.append(key)
+    return sorted(seen)
+
+
+def _day_digest(timeline: Timeline) -> list[dict[str, Any]]:
+    """A per-day summary for the model: where it was and how much happened."""
+    days: dict[str, dict[str, Any]] = {}
+    for entry in timeline.selected:
+        key = day_key(entry)
+        if not key:
+            continue
+        day = days.setdefault(key, {"date": key, "clips": 0, "videos": 0,
+                                    "places": [], "captions": []})
+        day["clips"] += 1
+        day["videos"] += int(entry.is_video)
+        if entry.place and entry.place not in day["places"]:
+            day["places"].append(entry.place)
+        if entry.caption and len(day["captions"]) < 6:
+            day["captions"].append(entry.caption)
+    return [days[k] for k in sorted(days)]
 
 
 def _trip_context(timeline: Timeline) -> str:
@@ -242,7 +286,12 @@ def _to_plan(raw: dict[str, Any], lookup: dict[str, TimelineEntry], timeline: Ti
         "transition_hints": hints,
         "chapter_markers": raw.get("chapter_markers"),
         "mood": raw.get("mood"),
+        "day_titles": raw.get("day_titles"),
+        "closing_quote": raw.get("closing_quote"),
     })
+    plan.day_titles = {k: " ".join(v.split()[:5]).rstrip(".")
+                       for k, v in plan.day_titles.items() if v}
+    plan.closing_quote = " ".join(plan.closing_quote.split()[:9]).rstrip(".")
     plan.chapter_markers = [c for c in plan.chapter_markers if 0 <= c.at_clip < len(ordered)]
     return plan
 
@@ -257,8 +306,12 @@ def plan_narrative(timeline: Timeline, cfg: NarrativeConfig) -> NarrativePlan:
     clips, lookup = _clip_payload(timeline)
     target = max(1, round(cfg.label_fraction * len(clips)))
     system_prompt = SYSTEM_PROMPT + CAPTION_TARGET_RULE.format(target=target, count=len(clips))
+    days = _day_digest(timeline)
     user_message = (
-        f"{_trip_context(timeline)}\n\nHere are the {len(clips)} selected clips:\n"
+        f"{_trip_context(timeline)}\n\n"
+        f"The trip runs over these {len(days)} day(s) - write a day_title for each date:\n"
+        f"{json.dumps(days, ensure_ascii=False, indent=1)}\n\n"
+        f"Here are the {len(clips)} selected clips:\n"
         f"{json.dumps(clips, ensure_ascii=False, indent=1)}"
     )
     messages = [
