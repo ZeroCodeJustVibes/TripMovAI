@@ -196,12 +196,44 @@ def extracted_audio(path: str | Path, cache_dir: str | Path | None = None) -> st
     return str(target) if target.exists() and target.stat().st_size > 1024 else None
 
 
+def use_system_ffmpeg() -> str | None:
+    """Make MoviePy use the system ffmpeg, as every other stage already does.
+
+    MoviePy defaults to the binary bundled with imageio-ffmpeg, which is built
+    without the GPU encoders and can differ in version from the ffmpeg the rest
+    of the pipeline shells out to. Must run before MoviePy is imported, since
+    it resolves the binary once.
+    """
+    import os
+    import shutil
+
+    if os.environ.get("IMAGEIO_FFMPEG_EXE"):
+        return os.environ["IMAGEIO_FFMPEG_EXE"]
+    system = shutil.which("ffmpeg")
+    if system:
+        os.environ["IMAGEIO_FFMPEG_EXE"] = system
+    return system
+
+
+def ffmpeg_binary() -> str:
+    """The ffmpeg MoviePy will actually run."""
+    import os
+    import shutil
+
+    return os.environ.get("IMAGEIO_FFMPEG_EXE") or shutil.which("ffmpeg") or "ffmpeg"
+
+
 def nvenc_available() -> bool:
-    """Whether this ffmpeg can encode H.264 on the GPU."""
+    """Whether the ffmpeg MoviePy uses can encode H.264 on the GPU.
+
+    Checking the system ffmpeg is not enough: MoviePy may be running a
+    different binary, and asking the wrong one reports a GPU encoder that then
+    fails at the first frame with "Unknown encoder".
+    """
     global _NVENC
     if _NVENC is None:
         try:
-            result = subprocess.run(["ffmpeg", "-v", "error", "-encoders"],
+            result = subprocess.run([ffmpeg_binary(), "-v", "error", "-encoders"],
                                     capture_output=True, text=True, timeout=30, check=False)
             _NVENC = "h264_nvenc" in (result.stdout or "")
         except (subprocess.SubprocessError, OSError):

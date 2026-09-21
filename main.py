@@ -25,6 +25,10 @@ from rich.progress import (BarColumn, MofNCompleteColumn, Progress, SpinnerColum
                            TextColumn, TimeElapsedColumn)
 from rich.table import Table
 
+import mediautil as _mediautil
+
+_mediautil.use_system_ffmpeg()   # before MoviePy resolves its binary
+
 import assemble as assemble_mod
 import map_render
 import mediautil

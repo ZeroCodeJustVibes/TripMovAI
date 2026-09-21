@@ -681,6 +681,50 @@ def _joined_segments(clip, segments: list[tuple[float, float]], duration: float)
     return joined.subclipped(0, min(duration, joined.duration or duration))
 
 
+def _flat_video_clip(footage, plate: Image.Image, above: Image.Image,
+                     rect: tuple[int, int, int, int], frame_size: tuple[int, int],
+                     duration: float, mask: Image.Image):
+    """A video shot composited by hand instead of through CompositeVideoClip.
+
+    The generic path alpha-blends four full-frame layers for every frame. Only
+    two things actually change: the footage inside its card, and nothing else.
+    So the backdrop is prepared once, the picture is pasted into its rectangle
+    through the rounded mask, and the caption/map layer is blended over just
+    the box it occupies. That is one memcpy plus two small blends per frame
+    rather than four full-frame ones.
+    """
+    from moviepy import VideoClip
+
+    base = np.array(plate.convert("RGB"), dtype=np.uint8)
+    overlay = np.array(above, dtype=np.uint8)
+    card_mask = (np.asarray(mask, dtype=np.float32) / 255.0)[..., None]
+    x, y, w, h = rect
+
+    visible = np.nonzero(overlay[..., 3])
+    if len(visible[0]):
+        top, bottom = int(visible[0].min()), int(visible[0].max()) + 1
+        left, right = int(visible[1].min()), int(visible[1].max()) + 1
+        box = (slice(top, bottom), slice(left, right))
+        over_rgb = overlay[box][..., :3].astype(np.float32)
+        over_alpha = (overlay[box][..., 3:4].astype(np.float32)) / 255.0
+    else:
+        box = over_rgb = over_alpha = None
+
+    def make_frame(t):
+        out = base.copy()
+        card = np.asarray(footage.get_frame(t), dtype=np.float32)
+        if card.shape[:2] != (h, w):                  # safety, should not happen
+            return out
+        region = out[y:y + h, x:x + w].astype(np.float32)
+        out[y:y + h, x:x + w] = (card * card_mask + region * (1.0 - card_mask)).astype(np.uint8)
+        if box is not None:
+            under = out[box].astype(np.float32)
+            out[box] = (over_rgb * over_alpha + under * (1.0 - over_alpha)).astype(np.uint8)
+        return out
+
+    return VideoClip(make_frame, duration=duration)
+
+
 def _ease_out(t: float) -> float:
     return 1.0 - (1.0 - max(0.0, min(1.0, t))) ** 3
 
@@ -959,13 +1003,23 @@ def build_clip(entry: TimelineEntry, duration: float, frame_size: tuple[int, int
     readable = playable_video(entry.filepath, cfg.remux_dir)
     if readable is None:
         raise ValueError("unreadable video")
-    source = VideoFileClip(readable, audio=False)
+    # Let ffmpeg scale while it decodes, rather than decoding a 1080x1920 frame
+    # and shrinking it in Python afterwards - measured 34 fps against 83 fps on
+    # a phone clip. The card already carries the source's aspect ratio, so
+    # asking for its exact size distorts nothing.
+    try:
+        source = VideoFileClip(readable, audio=False, target_resolution=(card_w, card_h))
+        prescaled = tuple(source.size) == (card_w, card_h)
+    except Exception as exc:  # noqa: BLE001 - odd build, odd stream
+        log.debug("decode-time scaling unavailable for %s: %s", entry.name, exc)
+        source = VideoFileClip(readable, audio=False)
+        prescaled = False
     if resources is not None:
         resources.append(source)
     # play the highlight stretches, exactly as the audio path does, so picture
     # and sound stay together
     video = _joined_segments(source, video_segments(entry, cfg), duration)
-    footage = video.resized((card_w, card_h)).with_duration(duration)
+    footage = (video if prescaled else video.resized((card_w, card_h))).with_duration(duration)
     rounded = ImageClip(np.asarray(mask, dtype=np.float32) / 255.0, is_mask=True).with_duration(duration)
     border = ImageClip(np.array(card_border_overlay(layout, cfg)), transparent=True)
 
@@ -1648,12 +1702,34 @@ def chunk_shots(shots: list["Shot"], cfg: AssembleConfig) -> list[list["Shot"]]:
         current.append(shot)
     if current:
         chunks.append(current)
+
+    # A stub at the end wastes a worker and, being shorter than the closing
+    # fade, would shorten it. Fold it back into the previous run, rejoining
+    # the shot if the boundary had split one in two.
+    if len(chunks) > 1:
+        tail = chunks[-1]
+        playing = sum((s.slice_end if s.slice_end is not None else s.duration) - s.slice_start
+                      for s in tail)
+        if playing < max(1.5, cfg.crossfade * 3):
+            previous = chunks[-2]
+            if (previous[-1].entry is tail[0].entry and previous[-1].slice_end is not None
+                    and tail[0].slice_start == previous[-1].slice_end):
+                whole = replace(tail[0], slice_start=0.0, slice_end=None,
+                                transition=previous[-1].transition)
+                chunks[-2] = previous[:-1] + [whole] + tail[1:]
+            else:
+                chunks[-2] = previous + tail
+            chunks.pop()
     return chunks
 
 
 def _render_chunk(job: dict) -> str:
     """Render one run of shots to a silent file. Runs in a worker process."""
     import logging as worker_logging
+
+    from mediautil import use_system_ffmpeg
+
+    use_system_ffmpeg()          # a spawned worker resolves its own binary
 
     from moviepy import CompositeVideoClip, vfx
 
@@ -1714,9 +1790,13 @@ def _render_chunk(job: dict) -> str:
     if not clips:
         raise RuntimeError("every clip in this chunk failed to build")
 
+    # whole frames, so the chunks concatenate without drifting a frame each
+    position = round(position * cfg.fps) / cfg.fps
     video = CompositeVideoClip(clips, size=frame_size).with_duration(position)
     if job["last"]:
-        video = video.with_effects([vfx.FadeOut(min(1.2, position / 8))])
+        # the closing fade belongs to the *film*, not to this chunk, so its
+        # length comes from the whole running time
+        video = video.with_effects([vfx.FadeOut(min(1.2, job["total"] / 8, position))])
 
     try:
         with tempfile.TemporaryDirectory(prefix="tripvid_chunk_") as scratch:
@@ -1787,8 +1867,10 @@ def encoder_settings(cfg: AssembleConfig, parallel: int = 1) -> tuple[str, str |
     if wanted == "auto":
         wanted = "nvenc" if (nvenc_available() and parallel <= 4) else "x264"
     if wanted == "nvenc" and nvenc_available():
-        return "h264_nvenc", None, ["-preset", "p4", "-rc", "vbr", "-cq", "23",
-                                    "-b:v", "0", "-movflags", "+faststart"]
+        # MoviePy always passes -preset through, so it has to be an NVENC one
+        # (p1 fastest .. p7 best); the rate control goes in the extra args
+        return "h264_nvenc", "p4", ["-rc", "vbr", "-cq", "23", "-b:v", "0",
+                                    "-movflags", "+faststart"]
     if wanted == "nvenc":
         log.warning("h264_nvenc is not available in this ffmpeg - using x264")
     return cfg.codec, cfg.preset, list(cfg.ffmpeg_params)
@@ -1831,6 +1913,13 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
                 and shot.plan_index < len(map_tracks):
             shot.map_track = map_tracks[shot.plan_index]
 
+    # Put every shot on the frame grid before anything is scheduled. Cuts then
+    # land on real frames, and a chunked render and a single-pass one agree to
+    # the frame instead of drifting apart by the rounding at each boundary.
+    frame = 1.0 / max(cfg.fps, 1)
+    for shot in shots:
+        shot.duration = max(frame, round(shot.duration / frame) * frame)
+
     schedule = schedule_shots(shots, cfg)
     total = schedule[-1][1] + schedule[-1][2]
 
@@ -1870,7 +1959,7 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
 
     jobs = [{"shots": chunk, "cfg": cfg, "frame_size": frame_size,
              "output": str(scratch / f"chunk_{i:03d}.mp4"), "encoder": settings,
-             "first": i == 0, "last": i == len(chunks) - 1}
+             "first": i == 0, "last": i == len(chunks) - 1, "total": total}
             for i, chunk in enumerate(chunks)]
 
     done = 0
