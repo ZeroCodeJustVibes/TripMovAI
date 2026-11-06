@@ -24,6 +24,9 @@ scikit-learn>=1.4
 # Music analysis: beats, energy and drops, so the cut can follow the track
 librosa>=0.10
 
+# Optional: --blur-nudity. Without it that flag simply does nothing.
+nudenet>=3.4
+
 # Map rendering: tiles are fetched and stitched directly (httpx), because the
 # per-location views, fly-to animation and shared tile cache need control that
 # a one-shot static-map helper does not offer.

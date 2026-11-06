@@ -72,6 +72,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-highlights", action="store_true",
                    help="use the opening seconds of a long video instead of its best bits")
     p.add_argument("--blur-threshold", type=float, default=80.0, help="Laplacian variance below which a shot is dropped")
+    p.add_argument("--blur-nudity", action="store_true",
+                   help="detect explicit regions and blur them in the finished film")
+    p.add_argument("--nudity-threshold", type=float, default=0.40,
+                   help="detector confidence required before something is blurred")
     p.add_argument("--prefer-people", action="store_true",
                    help="favour shots with people in them when choosing clips")
     p.add_argument("--people-weight", type=float, default=0.35,
@@ -106,6 +110,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     extra.add_argument("--encoder", choices=["auto", "x264", "nvenc"], default="auto",
                        help="auto uses the GPU encoder when few workers are running")
     extra.add_argument("--resolution", default=None, metavar="WxH", help="force output resolution, e.g. 1920x1080")
+    extra.add_argument("--vertical", action="store_true",
+                       help="9:16 cut for a phone: 1080x1920, map in the bottom corner")
     extra.add_argument("--no-location", action="store_true",
                        help="do not draw the location line under the caption")
     extra.add_argument("--no-pair-portraits", action="store_true",
@@ -331,6 +337,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         cfg = understand_mod.UnderstandConfig(
             blip_model=args.blip_model, whisper_model=args.whisper_model, device=device,
+            blur_nudity=args.blur_nudity, nudity_threshold=args.nudity_threshold,
             find_highlights=not args.no_highlights,
             highlight_budget=args.max_video_duration,
             highlight_segments=args.video_scenes)
@@ -341,10 +348,14 @@ def run(args: argparse.Namespace) -> int:
             whisper_task = progress.add_task("Whisper transcripts", total=max(pending_audio, 1))
             scan_task = progress.add_task("video highlights", total=max(
                 sum(1 for e in timeline.selected if e.is_video), 1))
+            modesty_task = progress.add_task("nudity scan",
+                                             total=max(len(timeline.selected), 1),
+                                             visible=args.blur_nudity)
             understand_mod.run(timeline, cfg, {
                 "caption": lambda d, t: progress.update(caption_task, completed=d, total=t),
                 "whisper": lambda d, t: progress.update(whisper_task, completed=d, total=t),
                 "highlights": lambda d, t: progress.update(scan_task, completed=d, total=t),
+                "nudity": lambda d, t: progress.update(modesty_task, completed=d, total=t),
             }, checkpoint=lambda: timeline.save(timeline_path))
         timeline.save(timeline_path)
     summary_table("understanding", understand_mod.stats(timeline))
@@ -438,13 +449,20 @@ def run(args: argparse.Namespace) -> int:
     # ---------------------------------------------------------- Phase 6
     phase_header(6, "Video assembly")
     target = parse_duration(args.duration)
+    resolution = parse_resolution(args.resolution)
+    if args.vertical and resolution is None:
+        resolution = (1080, 1920)
+    elif args.vertical and resolution[0] > resolution[1]:
+        console.print(f"[yellow]--vertical with a landscape --resolution "
+                      f"{resolution[0]}x{resolution[1]}[/yellow] - using the resolution as given")
     cfg = assemble_mod.AssembleConfig(
         photo_duration=args.photo_duration,
         target_duration=target,
         max_video_duration=args.max_video_duration,
         use_highlights=not args.no_highlights,
+        blur_nudity=args.blur_nudity,
         map_mode="none" if (args.no_map or not map_tracks) else args.map_mode,
-        resolution=parse_resolution(args.resolution),
+        resolution=resolution,
         fps=args.fps,
         normalize_audio=not args.no_normalize_audio,
         clip_target_db=args.audio_target,

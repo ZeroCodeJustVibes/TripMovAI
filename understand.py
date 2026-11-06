@@ -36,6 +36,8 @@ class UnderstandConfig:
     max_new_tokens: int = 24
     num_beams: int = 3
     transcribe: bool = True
+    blur_nudity: bool = False        # find explicit regions so Phase 6 can blur them
+    nudity_threshold: float = 0.40
     find_highlights: bool = True     # scan long videos for their best moments
     highlight_budget: float = 15.0
     highlight_segments: int = 3
@@ -377,6 +379,42 @@ def transcribe_entries(entries: list[TimelineEntry], cfg: UnderstandConfig,
     return done
 
 
+# ------------------------------------------------------------- modesty
+
+def scan_nudity(entries: list[TimelineEntry], cfg: UnderstandConfig,
+                progress_cb: Callable | None = None,
+                checkpoint: Callable | None = None) -> int:
+    """Record where explicit regions are, for Phase 6 to blur.
+
+    Cached on the timeline as normalised boxes, so the detector runs once per
+    clip however often the film is re-rendered, and the result stays valid at
+    any output resolution.
+    """
+    import nudity
+
+    todo = [e for e in entries if "nudity" not in e.extra]
+    if not todo:
+        return 0
+
+    config = nudity.NudityConfig(threshold=cfg.nudity_threshold)
+    done, flagged = 0, 0
+    for entry in todo:
+        try:
+            result = nudity.scan(entry.filepath, entry.is_video, config)
+        except Exception as exc:  # noqa: BLE001 - never block the film on this
+            log.error("nudity scan failed for %s: %s", entry.name, exc)
+            result = {"boxes": [], "whole": False, "found": False}
+        entry.extra["nudity"] = result
+        flagged += int(bool(result.get("found")))
+        done += 1
+        if checkpoint:
+            checkpoint()
+        if progress_cb:
+            progress_cb(done, len(todo))
+    log.info("scanned %d clip(s) for nudity; %d will be blurred", done, flagged)
+    return done
+
+
 # ---------------------------------------------------------- highlights
 
 def scan_highlights(entries: list[TimelineEntry], cfg: UnderstandConfig,
@@ -432,6 +470,8 @@ def run(timeline: Timeline, cfg: UnderstandConfig,
         transcribe_entries(entries, cfg, progress.get("whisper"), checkpoint)
     if cfg.find_highlights:
         scan_highlights(entries, cfg, progress.get("highlights"), checkpoint)
+    if cfg.blur_nudity:
+        scan_nudity(entries, cfg, progress.get("nudity"), checkpoint)
     return timeline
 
 
@@ -446,4 +486,5 @@ def stats(timeline: Timeline) -> dict[str, object]:
         "mean_confidence": round(
             sum(e.caption_confidence or 0.0 for e in sel) / max(1, sum(1 for e in sel if e.caption)), 3),
         "videos_with_speech": sum(1 for e in sel if e.is_video and e.transcript),
+        "blurred": sum(1 for e in sel if (e.extra.get("nudity") or {}).get("found")) or "-",
     }

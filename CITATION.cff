@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use or build on this software, please cite it as below."
+title: "Trip Review Video Generator"
+authors:
+  - alias: "Br0ver"
+license: GPL-3.0-only
+date-released: 2026-11-06

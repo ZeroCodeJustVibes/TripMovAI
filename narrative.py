@@ -32,6 +32,9 @@ You receive a JSON list of clips in chronological order. Each clip has: id, file
 (photo/video), time, place (a location cluster id, coordinates, and often the name of the
 town or area), a machine-generated caption, and for videos a speech transcript.
 
+`speech` is a transcript of what is actually said in that clip - reliable, and the best
+source of a caption when it is there.
+
 IMPORTANT about `caption`: it comes from an image model that is frequently wrong - it
 mistakes a lake for a desert, invents ferris wheels, and describes stock photos. Treat it
 as a loose hint about mood and subject, never as fact. The `place` name and the time are
@@ -60,6 +63,13 @@ Rules:
   * Because the machine caption may be wrong, never assert a specific object, animal,
     landmark or activity unless the place name or transcript backs it up. Write lines that
     stay funny even if the image is not quite what the caption claims.
+  * WHEN A CLIP HAS `speech`, strongly prefer quoting it. Lift the funniest short phrase
+    somebody actually says - verbatim, their words, their punctuation - and put it in
+    double quotes: "we are definitely not lost". Up to 8 words for a quote. Pick the
+    fragment that is funny out of context: a complaint, a bad prediction, an understatement,
+    someone being talked over. Trim to a clean phrase rather than quoting a whole sentence,
+    never invent or "improve" the wording, and if nothing said is worth quoting, write an
+    ordinary caption instead.
   * Good: "Breakfast, eventually", "Nobody admits being lost", "Third pass, still uphill",
     "The weather had opinions", "Worth every step, allegedly".
   * Bad: "A beautiful mountain lake" (flat description), "LOL so random" (try-hard),
@@ -270,9 +280,21 @@ def _to_plan(raw: dict[str, Any], lookup: dict[str, TimelineEntry], timeline: Ti
         path = resolve(cid)
         if not path or not text:
             continue
-        words = str(text).strip().strip('"').rstrip(".").split()
-        if words:
-            captions[path] = " ".join(words[:6])
+        line = str(text).strip()
+        # a quoted caption is somebody's actual words: keep the quote marks and
+        # allow it a couple more, since trimming a quotation to six words often
+        # cuts the joke in half
+        quoted = len(line) > 2 and line[0] in '"\u201c\u2018\'' and line[-1] in '"\u201d\u2019\''
+        words = line.strip('"\u201c\u201d\u2018\u2019\'').rstrip(".").split()
+        if not words:
+            continue
+        limit = 8 if quoted else 6
+        trimmed = " ".join(words[:limit])
+        if quoted:
+            # a trimmed quotation should look trimmed, not broken off
+            captions[path] = f'"{trimmed}\u2026"' if len(words) > limit else f'"{trimmed}"'
+        else:
+            captions[path] = trimmed
 
     hints: dict[str, str] = {}
     for cid, hint in (raw.get("transition_hints") or {}).items():

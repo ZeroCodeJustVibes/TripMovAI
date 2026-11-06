@@ -44,6 +44,8 @@ FONT_CANDIDATES = [
 class AssembleConfig:
     photo_duration: float = 3.5
     max_video_duration: float = 15.0   # total seconds used from any one video
+    blur_nudity: bool = False          # blur what Phase 3 flagged
+    nudity_strength: float = 0.11
     use_highlights: bool = True        # play the best stretches, not the opening
     remux_dir: Path | None = None      # where repaired containers are cached
     audio_dir: Path | None = None      # where extracted clip audio is cached
@@ -58,6 +60,9 @@ class AssembleConfig:
     # beside it, and the map fills it rather than floating as a small badge.
     column_fraction: float = 0.24      # of frame width
     map_width_fraction: float = 0.24   # the map fills the column
+    # A tall frame has no room for a side column, so the map becomes a corner
+    # badge and the caption takes the band under the picture.
+    map_vertical_fraction: float = 0.27   # of frame width, portrait frames
     pair_portraits: bool = True        # show two tall photos side by side
     pair_duration_scale: float = 1.25  # a spread earns a little more time
     pair_lookahead: int = 6            # how far ahead to find a partner
@@ -162,6 +167,18 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
+def type_reference(frame_size: tuple[int, int]) -> float:
+    """The dimension type sizes are measured against.
+
+    Landscape frames size text from their height, as they always have. A phone
+    frame is only 1080 wide, so sizing from width alone would leave captions
+    too small to read at arm's length; the factor brings them back to the same
+    apparent size on screen.
+    """
+    width, height = frame_size
+    return height if width >= height else width * 1.33
+
+
 @dataclass
 class Layout:
     """Where everything goes, derived once per clip from the frame and media.
@@ -189,59 +206,96 @@ class Layout:
 
 def layout_for(media_sizes, frame_size: tuple[int, int], cfg: AssembleConfig,
                with_map: bool = True) -> Layout:
-    """Lay out one or two pictures beside the UI column.
+    """Lay the pictures out, beside the UI column or above it.
 
-    With a map on screen the column is reserved first and the picture takes
-    everything left over - which is what makes a full-height landscape shot sit
-    flush beside the map instead of the map shrinking to a badge. Without a map
-    there is nothing to reserve, so the picture uses the whole frame and the
-    caption sits on it.
+    In a landscape frame the UI column is reserved first and the picture takes
+    everything left over, so a full-height shot sits flush beside the map. A
+    tall phone frame has no width to spare for that, so the map shrinks into
+    the bottom-right corner, the caption takes the band beneath the picture,
+    and the picture itself spans the full width.
     """
     if isinstance(media_sizes, tuple):
         media_sizes = [media_sizes]
     media_sizes = [m for m in media_sizes if m and m[0] > 0 and m[1] > 0] or [(4, 3)]
 
     width, height = frame_size
-    margin = round(cfg.frame_margin * width)
-    ui = round(cfg.ui_margin * width)
-    gap = round(cfg.ui_margin * width * 0.4)
+    portrait = height > width
+    long_edge = max(width, height)
+    margin = round(cfg.frame_margin * long_edge)
+    ui = round(cfg.ui_margin * long_edge)
+    gap = round(cfg.ui_margin * long_edge * 0.4)
     area_x, area_y, area_w, area_h = _video_area(frame_size, cfg)
+    shows_map = with_map and cfg.map_mode == "overlay"
 
-    column = round(cfg.column_fraction * width) if (with_map and cfg.map_mode == "overlay") else 0
-    picture_x = area_x + margin + (column + gap if column else 0)
-    picture_w = max(80, area_x + area_w - margin - picture_x)
-    picture_h = max(60, area_h - 2 * margin)
+    if portrait:
+        # the map sits bottom right; the strip it stands in also carries the
+        # caption, so the picture is laid out above both
+        badge = round(width * cfg.map_vertical_fraction) if shows_map else 0
+        strip = (badge + gap) if badge else round(height * 0.09)
+        picture_x = area_x + margin
+        picture_w = max(80, area_w - 2 * margin)
+        picture_h = max(60, area_h - 2 * margin - strip)
+        picture_y = area_y + margin
+    else:
+        column = round(cfg.column_fraction * width) if shows_map else 0
+        picture_x = area_x + margin + (column + gap if column else 0)
+        picture_w = max(80, area_x + area_w - margin - picture_x)
+        picture_h = max(60, area_h - 2 * margin)
+        picture_y = area_y + margin
+        strip = 0
 
     aspects = [m[0] / m[1] for m in media_sizes]
     inner_gap = gap if len(aspects) > 1 else 0
-    panel_h = min(picture_h, (picture_w - inner_gap) / sum(aspects))
-    widths = [max(8, round(panel_h * a)) for a in aspects]
-    panel_h = max(8, round(panel_h))
 
-    total_w = sum(widths) + inner_gap
-    x = picture_x + (picture_w - total_w) // 2
-    y = area_y + (area_h - panel_h) // 2
-    panels, cursor = [], x
-    for w in widths:
-        panels.append((cursor, y, w, panel_h))
-        cursor += w + inner_gap
-    card = (x, y, total_w, panel_h)
+    if portrait and len(aspects) > 1:
+        # two pictures stack in a tall frame; side by side they would be slivers
+        panel_w = min(picture_w, (picture_h - inner_gap) * (1.0 / sum(1 / a for a in aspects)))
+        panel_w = max(8, round(panel_w))
+        heights = [max(8, round(panel_w / a)) for a in aspects]
+        total_h = sum(heights) + inner_gap
+        x = picture_x + (picture_w - panel_w) // 2
+        y = picture_y + (picture_h - total_h) // 2
+        panels, cursor = [], y
+        for h in heights:
+            panels.append((x, cursor, panel_w, h))
+            cursor += h + inner_gap
+        card = (x, y, panel_w, total_h)
+    else:
+        panel_h = min(picture_h, (picture_w - inner_gap) / sum(aspects))
+        widths = [max(8, round(panel_h * a)) for a in aspects]
+        panel_h = max(8, round(panel_h))
+        total_w = sum(widths) + inner_gap
+        x = picture_x + (picture_w - total_w) // 2
+        y = picture_y + (picture_h - panel_h) // 2
+        panels, cursor = [], x
+        for w in widths:
+            panels.append((cursor, y, w, panel_h))
+            cursor += w + inner_gap
+        card = (x, y, total_w, panel_h)
 
-    if column:
+    card_x, card_y, card_w, card_h = card
+    if portrait:
+        # the caption owns the bottom band, stopping short of the map
+        ui_left = area_x + margin
+        ui_bottom = area_y + area_h - margin
+        ui_top = max(margin, card_y + gap)
+        badge = round(width * cfg.map_vertical_fraction) if shows_map else 0
+        ui_right = area_x + area_w - margin - (badge + gap if badge else 0)
+    elif shows_map:
         ui_left, ui_top, ui_bottom = area_x + margin, area_y + margin, area_y + area_h - margin
-        ui_right = ui_left + column
+        ui_right = ui_left + round(cfg.column_fraction * width)
     else:                      # no column: the UI sits on the picture itself
-        ui_left = max(area_x + ui, x + gap)
-        ui_top = max(ui, y + gap)
-        ui_bottom = min(height - ui, y + panel_h - gap)
-        ui_right = min(area_x + area_w - ui, x + total_w - gap)
+        ui_left = max(area_x + ui, card_x + gap)
+        ui_top = max(ui, card_y + gap)
+        ui_bottom = min(height - ui, card_y + card_h - gap)
+        ui_right = min(area_x + area_w - ui, card_x + card_w - gap)
 
     return Layout(
         frame=frame_size,
         panels=panels,
         card=card,
-        radius=max(6, round(cfg.card_radius * width)),
-        border=max(1, round(cfg.card_border_width * width)),
+        radius=max(6, round(cfg.card_radius * long_edge)),
+        border=max(1, round(cfg.card_border_width * long_edge)),
         ui_left=ui_left,
         ui_top=ui_top,
         ui_bottom=ui_bottom,
@@ -397,23 +451,25 @@ def caption_overlay(text: str, layout: Layout, cfg: AssembleConfig,
     if not text and not location and not eyebrow:
         return None
     width, height = layout.frame
+    ref = type_reference(layout.frame)
     overlay = Image.new("RGBA", layout.frame, (0, 0, 0, 0))
     measure = ImageDraw.Draw(overlay)
 
-    pad_x, pad_y = round(height * 0.026), round(height * 0.020)
-    inner_w = max(120, min(layout.ui_width, round(width * 0.52)) - 2 * pad_x)
+    pad_x, pad_y = round(ref * 0.026), round(ref * 0.020)
+    widest = layout.ui_width if height > width else min(layout.ui_width, round(width * 0.52))
+    inner_w = max(120, widest - 2 * pad_x)
 
     caption_font, lines = (None, [])
     if text:
         caption_font, lines = fit_text(text, inner_w, 3, measure,
-                                       max(15, round(height * 0.036 * emphasis)),
-                                       max(11, round(height * 0.022)))
+                                       max(15, round(ref * 0.036 * emphasis)),
+                                       max(11, round(ref * 0.022)))
     if caption_font is None:
-        caption_font = _load_font(max(15, round(height * 0.036 * emphasis)))
+        caption_font = _load_font(max(15, round(ref * 0.036 * emphasis)))
     caption_lh = round((caption_font.getbbox("Ag")[3] - caption_font.getbbox("Ag")[1]) * 1.5)
-    eyebrow_font = _load_font(max(11, round(height * 0.024))) if eyebrow else None
+    eyebrow_font = _load_font(max(11, round(ref * 0.024))) if eyebrow else None
     eyebrow_h = round((eyebrow_font.getbbox("Ag")[3] - eyebrow_font.getbbox("Ag")[1]) * 1.9) if eyebrow else 0
-    icon = max(11.0, height * 0.030)
+    icon = max(11.0, ref * 0.030)
 
     content_w = max([measure.textlength(line, font=caption_font) for line in lines] or [0])
 
@@ -422,9 +478,9 @@ def caption_overlay(text: str, layout: Layout, cfg: AssembleConfig,
     # it fits rather than letting it run off the card.
     loc_font, loc_w = None, 0.0
     if location:
-        for points in range(round(height * 0.027), max(10, round(height * 0.017)) - 1, -1):
+        for points in range(round(ref * 0.027), max(10, round(ref * 0.017)) - 1, -1):
             loc_font = _load_font(points)
-            loc_w = icon + height * 0.008 + measure.textlength(location, font=loc_font)
+            loc_w = icon + ref * 0.008 + measure.textlength(location, font=loc_font)
             if loc_w <= inner_w:
                 break
     loc_h = (loc_font.getbbox("Ag")[3] - loc_font.getbbox("Ag")[1]) if loc_font else 0
@@ -454,8 +510,8 @@ def caption_overlay(text: str, layout: Layout, cfg: AssembleConfig,
         y += caption_lh
     if location:
         if lines:
-            y += round(height * 0.012)
-            card_draw.line([pad_x, y - round(height * 0.007), card_w - pad_x, y - round(height * 0.007)],
+            y += round(ref * 0.012)
+            card_draw.line([pad_x, y - round(ref * 0.007), card_w - pad_x, y - round(ref * 0.007)],
                            fill=(255, 255, 255, 38), width=1)
         used = _draw_pin_icon(card_draw, pad_x, y, icon)
         card_draw.text((pad_x + used, y), location, font=loc_font, fill=(235, 238, 245, 224))
@@ -479,6 +535,12 @@ def map_geometry(layout: Layout, cfg: AssembleConfig) -> tuple[int, tuple[int, i
         panel = int(width * cfg.side_panel_fraction)
         size = min(panel - int(width * 0.03), height - int(height * 0.06))
         return size, (width - panel + (panel - size) // 2, (height - size) // 2)
+    if height > width:
+        # a tall frame: a badge in the bottom-right corner, on the same
+        # baseline as the caption beside it
+        size = round(width * cfg.map_vertical_fraction)
+        margin = round(cfg.frame_margin * max(width, height))
+        return size, (width - margin - size, height - margin - size)
     size = min(layout.ui_width, round(width * cfg.map_width_fraction))
     return size, (layout.ui_left, layout.ui_top)
 
@@ -565,15 +627,16 @@ def day_card_layout(sizes: list[tuple[int, int]], frame_size: tuple[int, int],
 
     aspects = [w / h for w, h in sizes] or [4 / 3]
     row_gap = gap if len(aspects) > 1 else 0
-    max_h = height * cfg.day_card_gallery_height
+    max_h = height * (0.30 if height > width else cfg.day_card_gallery_height)
     max_w = width - 2 * margin - row_gap * (len(aspects) - 1)
     panel_h = round(min(max_h, max_w / sum(aspects)))
     widths = [max(8, round(panel_h * a)) for a in aspects]
     row_w = sum(widths) + row_gap * (len(widths) - 1)
 
-    map_size = round(width * cfg.day_card_map_fraction)
-    text_gap = round(height * 0.042)
-    map_gap = round(height * 0.030)
+    tall = height > width
+    map_size = round(width * (0.17 if tall else cfg.day_card_map_fraction))
+    text_gap = round(height * (0.030 if tall else 0.042))
+    map_gap = round(height * (0.022 if tall else 0.030))
     text_height = text_height or round(height * 0.22)
 
     block = panel_h + text_gap + text_height + map_gap + map_size
@@ -597,7 +660,7 @@ def day_card_layout(sizes: list[tuple[int, int]], frame_size: tuple[int, int],
         "panels": panels,
         "row": (round((width - row_w) / 2), top, row_w, panel_h),
         "text_top": text_top,
-        "text_width": round(width * 0.66),
+        "text_width": round(width * (0.86 if height > width else 0.66)),
         "map": (round((width - map_size) / 2), text_top + text_height + map_gap,
                 map_size, map_size),
         "radius": max(6, round(cfg.card_radius * width)),
@@ -610,19 +673,20 @@ def day_card_text_height(shot: "Shot", text_width: int, frame_size: tuple[int, i
     """How tall the title block actually is, so the stack can be laid out
     around it rather than assuming a fixed height."""
     width, height = frame_size
+    ref = type_reference(frame_size)      # must match what day_card_text draws
     draw = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
     total = 0
     if shot.eyebrow:
-        font = _load_font(max(12, round(height * 0.026)))
-        total += round((font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) * 1.42) + round(height * 0.012)
+        font = _load_font(max(12, round(ref * 0.026)))
+        total += round((font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) * 1.42) + round(ref * 0.012)
     if shot.caption:
         font, lines = fit_text(shot.caption, text_width, 3, draw,
-                               max(20, round(height * cfg.day_card_title)),
-                               max(16, round(height * 0.034)))
+                               max(20, round(ref * cfg.day_card_title)),
+                               max(16, round(ref * 0.034)))
         total += round((font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) * 1.42) * len(lines)
     if shot.location:
-        font = _load_font(max(12, round(height * 0.030)))
-        total += round(height * 0.014) + round((font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) * 1.42)
+        font = _load_font(max(12, round(ref * 0.030)))
+        total += round(ref * 0.014) + round((font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) * 1.42)
     return total
 
 
@@ -630,6 +694,7 @@ def day_card_text(shot: "Shot", geometry: dict, frame_size: tuple[int, int],
                   cfg: AssembleConfig) -> Image.Image:
     """The centred title block: eyebrow, title, then date and place."""
     width, height = frame_size
+    ref = type_reference(frame_size)
     overlay = Image.new("RGBA", frame_size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     centre = width / 2
@@ -643,22 +708,22 @@ def day_card_text(shot: "Shot", geometry: dict, frame_size: tuple[int, int],
         return line_h
 
     if shot.eyebrow:
-        eyebrow_font = _load_font(max(12, round(height * 0.026)))
+        eyebrow_font = _load_font(max(12, round(ref * 0.026)))
         spaced = " ".join(shot.eyebrow.upper())      # letterspaced, like a chapter mark
-        y += centred(spaced, eyebrow_font, (235, 92, 48, 250)) + round(height * 0.012)
+        y += centred(spaced, eyebrow_font, (235, 92, 48, 250)) + round(ref * 0.012)
 
     if shot.caption:
         title_font, title_lines = fit_text(shot.caption, geometry["text_width"], 3, draw,
-                                           max(20, round(height * cfg.day_card_title)),
-                                           max(16, round(height * 0.034)))
+                                           max(20, round(ref * cfg.day_card_title)),
+                                           max(16, round(ref * 0.034)))
         for line in title_lines:
             y += centred(line, title_font, (255, 255, 255, 250))
 
     if shot.location:
-        y += round(height * 0.014)
+        y += round(ref * 0.014)
         sub_font, sub_lines = fit_text(shot.location, geometry["text_width"], 1, draw,
-                                       max(12, round(height * 0.030)),
-                                       max(10, round(height * 0.020)))
+                                       max(12, round(ref * 0.030)),
+                                       max(10, round(ref * 0.020)))
         shot = replace(shot, location=sub_lines[0] if sub_lines else shot.location)
         rule = round(width * 0.05)
         draw.line([centre - rule, y - round(height * 0.009), centre + rule, y - round(height * 0.009)],
@@ -833,18 +898,20 @@ def build_closing_card(shot: "Shot", frame_size: tuple[int, int], cfg: AssembleC
     if backdrop_source is None:
         raise ValueError("no usable image for the closing card")
 
-    map_size = round(min(height * cfg.closing_map_fraction, width * 0.42))
+    tall = height > width
+    map_size = round(width * 0.62 if tall else min(height * cfg.closing_map_fraction, width * 0.42))
     map_rect = (round((width - map_size) / 2), 0, map_size, map_size)
 
     scratch = ImageDraw.Draw(Image.new("RGBA", frame_size))
-    text_width = round(width * 0.66)
+    ref = type_reference(frame_size)
+    text_width = round(width * (0.84 if tall else 0.66))
     quote_font, quote_lines = fit_text(shot.caption or "", text_width, 3, scratch,
-                                       max(20, round(height * cfg.closing_quote_size)),
-                                       max(16, round(height * 0.030)))
+                                       max(20, round(ref * cfg.closing_quote_size)),
+                                       max(16, round(ref * 0.030)))
     quote_lh = round((quote_font.getbbox("Ag")[3] - quote_font.getbbox("Ag")[1]) * 1.45)
     stats_font, stats_lines = fit_text(shot.location or "", text_width, 1, scratch,
-                                       max(16, round(height * 0.040)),
-                                       max(12, round(height * 0.024)))
+                                       max(16, round(ref * 0.040)),
+                                       max(12, round(ref * 0.024)))
     stats_h = round((stats_font.getbbox("Ag")[3] - stats_font.getbbox("Ag")[1]) * 1.9) if stats_lines else 0
 
     text_h = quote_lh * len(quote_lines) + stats_h + round(height * 0.02)
@@ -858,8 +925,8 @@ def build_closing_card(shot: "Shot", frame_size: tuple[int, int], cfg: AssembleC
     plate = backdrop(backdrop_source, layout, cfg)
 
     # one photo per corner, small enough to frame the middle rather than crowd it
-    corner_w = round(width * cfg.closing_corner_width)
-    corner_h = round(height * 0.19)
+    corner_w = round(width * (0.22 if tall else cfg.closing_corner_width))
+    corner_h = round(corner_w * 1.35 if tall else height * 0.19)
     for index, image in enumerate(images[:4]):
         w, h = _fit(image.size, (corner_w, corner_h))
         x = margin if index % 2 == 0 else width - margin - w
@@ -941,11 +1008,16 @@ def build_clip(entry: TimelineEntry, duration: float, frame_size: tuple[int, int
     source = representative_pil(entry.filepath, entry.is_video, max_side=limit)
     if source is None:
         raise ValueError("unreadable media")
+    if not entry.is_video:
+        source = covered(source, entry, cfg)
     second = representative_pil(companion.filepath, False, max_side=limit) if companion else None
+    if second is not None and companion is not None:
+        second = covered(second, companion, cfg)
 
+    plate_source = source if not entry.is_video else covered(source, entry, cfg)
     sizes = [source.size] + ([second.size] if second else [])
     layout = layout_for(sizes, frame_size, cfg, with_map=cfg.map_mode == "overlay")
-    plate = backdrop(source, layout, cfg)
+    plate = backdrop(plate_source, layout, cfg)
     overlays = [o for o in overlays_for(layout) if o is not None]
     overlay_clips = [c for c in (overlay_clips_for(layout) if overlay_clips_for else []) if c is not None]
 
@@ -1019,6 +1091,13 @@ def build_clip(entry: TimelineEntry, duration: float, frame_size: tuple[int, int
     # play the highlight stretches, exactly as the audio path does, so picture
     # and sound stay together
     video = _joined_segments(source, video_segments(entry, cfg), duration)
+    if modesty_for(entry, cfg):
+        # a moving subject cannot be covered by a fixed box, so the whole card
+        # is blurred - applied here so the entrance animation inherits it too
+        import nudity
+
+        config = nudity.NudityConfig(strength=cfg.nudity_strength)
+        video = video.image_transform(lambda frame: nudity.blur_array(frame, config))
     footage = (video if prescaled else video.resized((card_w, card_h))).with_duration(duration)
     rounded = ImageClip(np.asarray(mask, dtype=np.float32) / 255.0, is_mask=True).with_duration(duration)
     border = ImageClip(np.array(card_border_overlay(layout, cfg)), transparent=True)
@@ -1141,15 +1220,39 @@ def trip_summary(timeline: Timeline, coords: list[tuple[float, float]] | None) -
     return " · ".join(parts)
 
 
+def modesty_for(entry: TimelineEntry, cfg: AssembleConfig) -> dict | None:
+    """What Phase 3 found in this clip, if blurring is switched on."""
+    if not cfg.blur_nudity:
+        return None
+    found = entry.extra.get("nudity")
+    return found if isinstance(found, dict) and found.get("found") else None
+
+
+def covered(image: Image.Image, entry: TimelineEntry, cfg: AssembleConfig) -> Image.Image:
+    """A still with its flagged regions blurred, or the whole frame if the
+    detection came from a moving clip where a fixed box would not hold."""
+    found = modesty_for(entry, cfg)
+    if not found:
+        return image
+    import nudity
+
+    config = nudity.NudityConfig(strength=cfg.nudity_strength)
+    if found.get("whole") or not found.get("boxes"):
+        return nudity.blur_everything(image, config)
+    return nudity.blur_regions(image, found["boxes"], config)
+
+
 def is_portrait(entry: TimelineEntry, threshold: float = 0.88) -> bool:
     return bool(entry.width and entry.height and entry.width / entry.height < threshold)
 
 
-def pair_portraits(entries: list, cfg: AssembleConfig, animated: set[int]) -> list:
-    """Fold portrait photos into shared clips, two side by side.
+def pair_portraits(entries: list, cfg: AssembleConfig, animated: set[int],
+                   portrait_frame: bool = False) -> list:
+    """Fold photos of the frame's "wrong" shape into shared clips, two at once.
 
-    A single tall photo in a wide frame leaves most of the picture area empty;
-    two fill it and read as a spread. Partners do not have to be adjacent -
+    In a wide frame that means two tall photos side by side; in a phone frame
+    it means two wide photos stacked, since that is the shape that leaves the
+    picture area half empty there. Partners do not have to be adjacent -
     portraits are usually scattered between landscape shots - so each one looks
     a few clips ahead for the next portrait *in the same place*, which keeps
     the location label and the map honest while barely disturbing the order.
@@ -1161,7 +1264,8 @@ def pair_portraits(entries: list, cfg: AssembleConfig, animated: set[int]) -> li
         return [(i, path, entry, None) for i, path, entry in entries]
 
     def pairable(index: int, entry: TimelineEntry) -> bool:
-        return not entry.is_video and is_portrait(entry) and index not in animated
+        wrong_shape = not is_portrait(entry) if portrait_frame else is_portrait(entry)
+        return not entry.is_video and wrong_shape and index not in animated
 
     def same_place(a: TimelineEntry, b: TimelineEntry) -> bool:
         """Compatible enough to share one location label.
@@ -1196,7 +1300,8 @@ def pair_portraits(entries: list, cfg: AssembleConfig, animated: set[int]) -> li
 
 
 def plan_shots(timeline: Timeline, plan: NarrativePlan, cfg: AssembleConfig,
-               map_tracks: Sequence | None, work_dir: Path | None = None) -> list[Shot]:
+               map_tracks: Sequence | None, work_dir: Path | None = None,
+               frame_size: tuple[int, int] | None = None) -> list[Shot]:
     """Turn the ordered clips into the shot list, chapters and finale included.
 
     Day cards open each calendar day with its own title, hero image and that
@@ -1215,7 +1320,8 @@ def plan_shots(timeline: Timeline, plan: NarrativePlan, cfg: AssembleConfig,
         return []
 
     animated = {i for i, t in enumerate(map_tracks or []) if getattr(t, "animated", False)}
-    paired = pair_portraits(resolved, cfg, animated)
+    tall = bool(frame_size and frame_size[1] > frame_size[0])
+    paired = pair_portraits(resolved, cfg, animated, tall)
 
     coords = map_render.route_for(timeline, [path for _, path, _ in resolved]) if map_tracks else []
     maps_dir = Path(work_dir or "./tmp") / "map_frames"
@@ -1234,7 +1340,8 @@ def plan_shots(timeline: Timeline, plan: NarrativePlan, cfg: AssembleConfig,
         if cfg.day_cards and day and day not in seen_days:
             seen_days.add(day)
             members = [e for _, _, e, _ in paired if day_of(e) == day]
-            gallery = day_gallery(members, cfg.day_card_images)
+            # a row of three is too thin to read on a phone frame
+            gallery = day_gallery(members, 2 if tall else cfg.day_card_images)
             hero = hero_for(members) or entry
             eyebrow, date_label = format_day_label(day, len(seen_days))
             title = plan.day_titles.get(day) or date_label
@@ -1482,6 +1589,64 @@ def normalized_volume(levels: dict[str, float] | None, role_volume: float,
     gain_db = max(min(target_db - levels["mean_db"], cfg.max_gain_db), -cfg.max_gain_db)
     total_db = min(gain_db + role_db, -cfg.headroom_db - levels["max_db"])
     return float(10 ** (total_db / 20))
+
+
+def speech_windows(entry: TimelineEntry, segments: list[tuple[float, float]],
+                   pad: float = 0.25) -> list[tuple[float, float]]:
+    """When someone is talking, in the clip's own timeline.
+
+    Whisper's segment times refer to the original file, but the clip only plays
+    the stretches Phase 3 picked out, so each window has to be mapped through
+    them - otherwise the volume would lift over the wrong part of the clip.
+    """
+    spoken = entry.extra.get("speech_segments") or []
+    if not spoken:
+        return []
+
+    windows, offset = [], 0.0
+    for piece_start, piece_end in segments:
+        for item in spoken:
+            try:
+                start, end = float(item["start"]) - pad, float(item["end"]) + pad
+            except (KeyError, TypeError, ValueError):
+                continue
+            low, high = max(start, piece_start), min(end, piece_end)
+            if high > low:
+                windows.append((offset + low - piece_start, offset + high - piece_start))
+        offset += piece_end - piece_start
+
+    windows.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1] + 0.2:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _lift_envelope(windows: list[tuple[float, float]], quiet: float, fade: float, total: float):
+    """Full level inside the windows, `quiet` outside them."""
+    complement, cursor = [], 0.0
+    for start, end in windows:
+        if start - cursor > 0.05:
+            complement.append((cursor, start))
+        cursor = max(cursor, end)
+    if total - cursor > 0.05:
+        complement.append((cursor, total))
+    return _gain_envelope(complement, quiet, fade, total)
+
+
+def _apply_envelope(audio, gain):
+    """Multiply an audio clip by a time -> gain function."""
+    def shape(get_frame, t):
+        frame = np.asarray(get_frame(t), dtype=float)
+        factor = gain(t)
+        if frame.ndim == 2:
+            return frame * factor[:, None]
+        return frame * float(factor[0])
+
+    return audio.transform(shape, keep_duration=True)
 
 
 def _gain_envelope(windows: list[tuple[float, float]], level: float, fade: float, total: float):
@@ -1894,12 +2059,13 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
     # longer drawn: the day cards and the location line carry that job.
     use_map = cfg.map_mode != "none" and bool(map_tracks)
 
-    shots = plan_shots(timeline, plan, cfg, map_tracks if use_map else None, work_dir)
+    shots = plan_shots(timeline, plan, cfg, map_tracks if use_map else None, work_dir,
+                       frame_size)
     if not shots:
         raise RuntimeError("nothing to assemble - no selected clips")
     pairs = sum(1 for shot in shots if shot.companion is not None)
     if pairs:
-        log.info("pairing %d portrait photo(s) side by side", pairs * 2)
+        log.info("pairing %d photo(s), two to a clip", pairs * 2)
 
     # transitions first (they decide the overlaps), then the length, then the
     # fine timing - each step depends on the one before it
@@ -1933,18 +2099,29 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
             if not wav:
                 continue
             track = AudioFileClip(wav)
-            audio = _joined_audio(track, video_segments(shot.entry, cfg), duration)
-            speaking = bool(shot.entry.transcript)
+            pieces = video_segments(shot.entry, cfg)
+            audio = _joined_audio(track, pieces, duration)
+            talking = speech_windows(shot.entry, pieces) if shot.entry.transcript else []
+
+            # Full level while someone is talking, down to ambient when nobody
+            # is - within the clip, not across it. A clip is rarely speech from
+            # end to end, and holding it at full for the silent half just
+            # raises wind and lift noise over the music.
             volume = normalized_volume(audio_levels(shot.entry),
-                                       1.0 if speaking else cfg.ambient_volume,
+                                       1.0 if talking else cfg.ambient_volume,
                                        cfg.clip_target_db, cfg)
-            clip_audio.append(audio.with_effects([
+            audio = audio.with_effects([
                 afx.MultiplyVolume(volume),
                 afx.AudioFadeIn(min(0.25, duration / 4)),
                 afx.AudioFadeOut(min(0.25, duration / 4)),
-            ]).with_start(start))
-            if speaking:
-                duck_windows.append((start, start + duration))
+            ])
+            if talking:
+                audio = _apply_envelope(audio, _lift_envelope(
+                    talking, cfg.ambient_volume, cfg.duck_fade, duration))
+            clip_audio.append(audio.with_start(start))
+            # and the music only steps back while the talking actually happens
+            for window_start, window_end in talking:
+                duck_windows.append((start + window_start, start + window_end))
         except Exception as exc:  # noqa: BLE001 - a silent clip is not fatal
             log.warning("no usable audio from %s: %s", shot.entry.name, exc)
 

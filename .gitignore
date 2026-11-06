@@ -22,3 +22,17 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Secrets: keep any .env variant out, but allow the template
+.env.*
+!.env.example
+
+# Personal photos / exports that might get dropped in here
+export/
+immich_export/
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.heic
+*.HEIC

@@ -1605,3 +1605,206 @@ class TestBuildClipIntegration:
             assert audio.duration == pytest.approx(clip.duration, abs=0.15)
         finally:
             source.close()
+
+
+class TestNudityBlur:
+    """Blurring is applied at render time from cached, normalised boxes."""
+
+    cfg_n = None
+
+    def _noisy(self, size=(600, 400)):
+        from PIL import Image
+        rng = np.random.default_rng(0)
+        return Image.fromarray(rng.integers(0, 255, (size[1], size[0], 3)).astype("uint8"))
+
+    def _detail(self, image, box):
+        a = np.asarray(image.convert("L"), dtype=float)
+        x, y, w, h = box
+        region = a[int(y * image.height):int((y + h) * image.height),
+                   int(x * image.width):int((x + w) * image.width)]
+        return float(np.abs(np.diff(region, axis=1)).mean())
+
+    def test_only_the_flagged_region_is_blurred(self):
+        import nudity
+        cfg = nudity.NudityConfig()
+        image = self._noisy()
+        box = [0.35, 0.35, 0.3, 0.3]
+        out = nudity.blur_regions(image, [box], cfg)
+        assert self._detail(out, box) < self._detail(image, box) * 0.1
+        elsewhere = [0.0, 0.0, 0.2, 0.2]
+        assert self._detail(out, elsewhere) == pytest.approx(self._detail(image, elsewhere), rel=0.01)
+
+    def test_whole_frame_blur_and_the_fast_array_version_agree(self):
+        import nudity
+        cfg = nudity.NudityConfig()
+        image = self._noisy()
+        whole = self._detail(nudity.blur_everything(image, cfg), [0, 0, 1, 1])
+        quick = float(np.abs(np.diff(nudity.blur_array(np.asarray(image), cfg).mean(axis=2), axis=1)).mean())
+        assert whole < 1.0 and quick < 1.0
+
+    def test_only_explicit_classes_count(self):
+        import nudity
+        assert "FACE_FEMALE" not in nudity.EXPLICIT
+        assert "FEET_EXPOSED" not in nudity.EXPLICIT
+        assert "MALE_BREAST_EXPOSED" not in nudity.EXPLICIT      # a shirtless swimmer
+        assert "FEMALE_BREAST_EXPOSED" in nudity.EXPLICIT
+
+    def test_detection_filters_by_class_and_score(self, monkeypatch):
+        import nudity
+
+        class Stub:
+            def detect(self, path):
+                return [{"class": "FACE_FEMALE", "score": 0.99, "box": [0, 0, 10, 10]},
+                        {"class": "FEMALE_BREAST_EXPOSED", "score": 0.2, "box": [0, 0, 10, 10]},
+                        {"class": "BUTTOCKS_EXPOSED", "score": 0.9, "box": [10, 20, 30, 40]}]
+
+        monkeypatch.setattr(nudity, "_detector", lambda: Stub())
+        boxes = nudity.detect_image(self._noisy((320, 240)), nudity.NudityConfig())
+        assert len(boxes) == 1                       # face ignored, low score ignored
+        assert all(0.0 <= v <= 1.0 for v in boxes[0])   # normalised
+
+    def test_render_honours_the_flag(self, tmp_path):
+        path = tmp_path / "shot.jpg"
+        self._noisy((900, 600)).save(path, quality=95)
+        e = TimelineEntry(filepath=str(path), type="photo")
+        e.width, e.height = 900, 600
+        e.extra["nudity"] = {"boxes": [[0.3, 0.3, 0.4, 0.4]], "whole": False, "found": True}
+
+        on = assemble.AssembleConfig(resolution=(480, 270), map_mode="none", blur_nudity=True)
+        off = assemble.AssembleConfig(resolution=(480, 270), map_mode="none")
+        blurred = np.asarray(assemble.build_clip(e, 1.0, (480, 270), on, lambda l: [],
+                                                 animate=False).get_frame(0.5), dtype=float)
+        plain = np.asarray(assemble.build_clip(e, 1.0, (480, 270), off, lambda l: [],
+                                               animate=False).get_frame(0.5), dtype=float)
+        assert np.abs(blurred - plain).mean() > 1.0          # the flag changes the picture
+        assert assemble.modesty_for(e, off) is None          # and off means off
+
+    def test_a_clean_clip_is_left_alone(self):
+        e = TimelineEntry(filepath="/x/a.jpg", type="photo")
+        e.extra["nudity"] = {"boxes": [], "whole": False, "found": False}
+        cfg = assemble.AssembleConfig(blur_nudity=True)
+        assert assemble.modesty_for(e, cfg) is None
+
+
+class TestSpeechLedAudio:
+    def _entry(self, spoken):
+        e = entry("v.mp4", kind="video", duration=30.0)
+        e.transcript = "something was said"
+        e.extra["speech_segments"] = [{"start": a, "end": b} for a, b in spoken]
+        return e
+
+    def test_speech_is_mapped_through_the_played_stretches(self):
+        e = self._entry([(12.0, 15.0), (22.0, 24.0)])
+        windows = assemble.speech_windows(e, [(10.0, 20.0), (21.0, 26.0)], pad=0.0)
+        assert windows == [(2.0, 5.0), (11.0, 13.0)]
+
+    def test_speech_outside_the_played_stretches_is_dropped(self):
+        e = self._entry([(1.0, 3.0)])
+        assert assemble.speech_windows(e, [(10.0, 20.0)]) == []
+
+    def test_overlapping_windows_merge(self):
+        e = self._entry([(11.0, 13.0), (13.2, 15.0)])
+        windows = assemble.speech_windows(e, [(10.0, 20.0)], pad=0.0)
+        assert len(windows) == 1 and windows[0] == (1.0, 5.0)
+
+    def test_the_clip_is_loud_while_talking_and_quiet_otherwise(self):
+        cfg = assemble.AssembleConfig()
+        gain = assemble._lift_envelope([(2.0, 5.0)], cfg.ambient_volume, cfg.duck_fade, 10.0)
+        assert float(gain(np.array([3.5]))[0]) == pytest.approx(1.0)
+        assert float(gain(np.array([8.0]))[0]) == pytest.approx(cfg.ambient_volume)
+        assert float(gain(np.array([0.2]))[0]) == pytest.approx(cfg.ambient_volume)
+
+    def test_a_silent_clip_has_no_windows(self):
+        e = entry("v.mp4", kind="video", duration=10.0)
+        assert assemble.speech_windows(e, [(0.0, 10.0)]) == []
+
+
+class TestQuotedCaptions:
+    def _plan(self, text):
+        tl = Timeline([TimelineEntry(filepath="/x/a.mp4", type="video", selected=True)])
+        _, lookup = narrative._clip_payload(tl)
+        return narrative._to_plan({"ordered_clips": ["c0"], "captions": {"c0": text}},
+                                  lookup, tl).captions["/x/a.mp4"]
+
+    def test_a_quote_keeps_its_quote_marks(self):
+        assert self._plan('"we are definitely not lost"') == '"we are definitely not lost"'
+
+    def test_a_long_quote_is_trimmed_visibly(self):
+        out = self._plan('"we are definitely not lost right now I promise"')
+        assert out.startswith('"') and out.endswith('…"')
+        assert len(out.strip('"…').split()) == 8          # quotes get a little more room
+
+    def test_plain_captions_still_cap_at_six_words(self):
+        assert self._plan("Nobody admits being lost at all today") == "Nobody admits being lost at all"
+
+    def test_the_prompt_asks_for_quotes_from_speech(self):
+        assert "prefer quoting it" in narrative.SYSTEM_PROMPT
+        assert "verbatim" in narrative.SYSTEM_PROMPT
+
+
+class TestVerticalLayout:
+    """A phone cut: no side column, map in the corner, text sized to be read."""
+
+    cfg = assemble.AssembleConfig()
+    PHONE = (1080, 1920)
+    WIDE = (1920, 1080)
+
+    def test_the_map_moves_to_the_bottom_right_corner(self):
+        layout = assemble.layout_for((3024, 4032), self.PHONE, self.cfg)
+        size, (x, y) = assemble.map_geometry(layout, self.cfg)
+        assert x + size <= 1080 and y + size <= 1920
+        assert x > 1080 * 0.55 and y > 1920 * 0.7          # bottom right
+        assert size == pytest.approx(1080 * 0.27, abs=3)    # small
+
+    def test_the_picture_spans_the_width_and_the_caption_sits_below(self):
+        layout = assemble.layout_for((3024, 4032), self.PHONE, self.cfg)
+        x, y, w, h = layout.card
+        margin = round(self.cfg.frame_margin * 1920)
+        assert w == pytest.approx(1080 - 2 * margin, abs=2)
+        _, (map_x, map_y) = assemble.map_geometry(layout, self.cfg)
+        assert y + h <= map_y + 2                           # picture clears the strip
+        assert layout.ui_right <= map_x                     # caption clears the map
+
+    def test_landscape_layout_is_unchanged(self):
+        layout = assemble.layout_for((4000, 3000), self.WIDE, self.cfg)
+        size, (x, y) = assemble.map_geometry(layout, self.cfg)
+        assert (x, y) == (layout.ui_left, layout.ui_top)    # still the top-left column
+        assert size == pytest.approx(1920 * 0.24, abs=3)
+        assert layout.card[3] == pytest.approx(1080 - 2 * round(0.024 * 1920), abs=2)
+
+    def test_pairs_stack_in_a_tall_frame(self):
+        pair = assemble.layout_for([(4000, 3000), (4000, 3000)], self.PHONE, self.cfg)
+        assert len(pair.panels) == 2
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = pair.panels
+        assert x1 == x2 and w1 == w2                        # same column
+        assert y2 > y1 + h1 - 1                             # one above the other
+
+    def test_pairs_sit_side_by_side_in_a_wide_frame(self):
+        pair = assemble.layout_for([(3024, 4032), (3024, 4032)], self.WIDE, self.cfg)
+        (x1, y1, _, h1), (x2, y2, _, _) = pair.panels
+        assert y1 == y2 and h1 == pair.panels[1][3]
+        assert x2 > x1
+
+    def test_a_tall_frame_pairs_wide_photos_instead(self):
+        wide = [entry(f"w{i}.jpg", i) for i in range(2)]
+        for e in wide:
+            e.width, e.height = 4000, 3000
+        entries = [(i, e.filepath, e) for i, e in enumerate(wide)]
+        assert assemble.pair_portraits(entries, self.cfg, set(), True)[0][3] is not None
+        assert assemble.pair_portraits(entries, self.cfg, set(), False)[0][3] is None
+
+    def test_type_is_scaled_up_for_a_narrow_frame(self):
+        assert assemble.type_reference(self.WIDE) == 1080          # unchanged: the height
+        assert assemble.type_reference(self.PHONE) > 1080          # not just the width
+        tall = assemble.caption_overlay("Nobody admits being lost",
+                                        assemble.layout_for((3024, 4032), self.PHONE, self.cfg),
+                                        self.cfg, location="Costa da Caparica · 12 m")
+        pixels = tall.load()
+        inked = [y for y in range(1920) if any(pixels[x, y][3] > 0 for x in range(0, 1080))]
+        assert inked and max(inked) <= 1920 - round(0.024 * 1920) + 2   # inside the margin
+
+    def test_nothing_is_drawn_outside_the_frame(self):
+        for media in [(3024, 4032), (4000, 3000), (1080, 1920)]:
+            layout = assemble.layout_for(media, self.PHONE, self.cfg)
+            x, y, w, h = layout.card
+            assert x >= 0 and y >= 0 and x + w <= 1080 and y + h <= 1920
