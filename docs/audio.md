@@ -9,8 +9,9 @@ them), or a folder. A folder plays in **natural** filename order, so `2 - song`
 comes before `10 - song` rather than after it. A playlist mixes masters from different
 years, so each song is normalised on its own before the joins - otherwise one
 track arrives twice as loud as the one before it - and consecutive songs
-crossfade rather than butting together. The bed is then looped or trimmed to
-the length of the film.
+crossfade rather than butting together. The film is kept within the bed's
+length (shots are dropped if needed), so the bed is only trimmed; it loops
+only with `--allow-overtime`.
 
 A clip's own sound follows the talking rather than the clip: full level while
 someone is speaking, down to `ambient_volume` when nobody is. Whisper's segment

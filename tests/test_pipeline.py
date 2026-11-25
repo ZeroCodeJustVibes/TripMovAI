@@ -1119,8 +1119,13 @@ class TestMultipleSongs:
         assert level(2, 8) == pytest.approx(level(14, 19), abs=2.0)   # matched in the mix
 
     def test_a_missing_track_is_skipped_not_fatal(self, tiny_music):
-        bed, _ = assemble.build_music_bed([tiny_music], 8.0, assemble.AssembleConfig())
+        cfg = assemble.AssembleConfig(allow_overtime=True)
+        bed, _ = assemble.build_music_bed([tiny_music], 8.0, cfg)
         assert bed is not None and bed.duration == pytest.approx(8.0, abs=0.1)
+
+    def test_the_bed_does_not_loop_without_overtime(self, tiny_music):
+        bed, _ = assemble.build_music_bed([tiny_music], 30.0, assemble.AssembleConfig())
+        assert bed.duration < 30.0
 
 
 class TestTargetDuration:
@@ -1174,6 +1179,26 @@ class TestTargetDuration:
         shots = self._shots()
         assert assemble.fit_to_duration(shots, cfg) == 3.5
         assert all(s.duration in (3.5, 6.0) for s in shots)
+
+    def test_film_never_runs_past_the_music(self, caplog):
+        # 2 x 6s videos + 8 photos at 1.6s minimum cannot fit 15s: shots go
+        cfg = assemble.AssembleConfig(target_duration=15.0, **self.cfg_base)
+        shots = self._shots()
+        with caplog.at_level("WARNING"):
+            schedule = assemble.fit_to_music(shots, None, 15.0, cfg)
+        assert schedule[-1][1] + schedule[-1][2] <= 15.0 + 1e-6
+        assert len(shots) < 10 and "dropped" in caplog.text
+
+    def test_a_target_past_the_music_is_capped(self):
+        cfg = assemble.AssembleConfig(target_duration=60.0, **self.cfg_base)
+        schedule = assemble.fit_to_music(self._shots(), None, 40.0, cfg)
+        assert 39.5 < schedule[-1][1] + schedule[-1][2] <= 40.0 + 1e-6
+
+    def test_overtime_keeps_every_shot(self):
+        cfg = assemble.AssembleConfig(target_duration=15.0, allow_overtime=True, **self.cfg_base)
+        shots = self._shots()
+        schedule = assemble.fit_to_music(shots, None, None, cfg)
+        assert len(shots) == 10 and schedule[-1][1] + schedule[-1][2] > 15.0
 
     def test_duration_parsing(self):
         import main

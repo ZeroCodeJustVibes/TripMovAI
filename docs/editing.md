@@ -60,7 +60,11 @@ playlist's length (songs minus their crossfade overlaps) becomes the target, so
 the film ends with the last song instead of the music being looped or cut
 mid-phrase. Measured on a real run: a 234.1 s track produced a 233.3 s film.
 If the clips alone are longer than the music - videos and title cards cannot be
-squeezed - it says so up front and the music loops.
+squeezed - it says so up front and drops the weakest shots (lowest quality
+score first; a day card goes with its last clip) until the film fits, so the
+music never loops. A `--duration` longer than the music is capped to it.
+`--allow-overtime` turns this off: every shot is kept and the music loops
+under the overrun.
 
 `--duration 3m30s` sets the length explicitly instead. Either way the length is the input, and the photo timing is stretched
 or squeezed to land on it. Videos keep their own length (trimming them further

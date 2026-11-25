@@ -111,6 +111,9 @@ class AssembleConfig:
     music_volume: float = 1.0
     music_crossfade: float = 2.5      # overlap between consecutive songs
     target_duration: float | None = None   # stretch/squeeze photos to this length
+    # The film never runs past the end of the music unless this is set: shots
+    # are dropped to fit instead. With it, the music loops under the overrun.
+    allow_overtime: bool = False
 
     # --- cutting to the music -------------------------------------------
     beat_sync: bool = True             # land cuts on beats
@@ -1762,8 +1765,13 @@ def build_music_bed(paths: list[str], total: float, cfg: AssembleConfig):
         cursor += song.duration - (fade if index < len(songs) - 1 else 0.0)
 
     bed = CompositeAudioClip(placed).with_duration(cursor) if len(placed) > 1 else placed[0]
-    if bed.duration < total:
-        bed = bed.with_effects([afx.AudioLoop(duration=total)])
+    if bed.duration < total - 1e-3:
+        if cfg.allow_overtime:
+            bed = bed.with_effects([afx.AudioLoop(duration=total)])
+        else:
+            # fit_to_music should have prevented this; never loop silently
+            log.warning("film (%.1fs) runs past the music (%.1fs) - the tail is silent",
+                        total, bed.duration)
     return bed.subclipped(0, min(total, bed.duration)), opened
 
 
@@ -1819,6 +1827,95 @@ def build_audio(music_paths, total: float, duck_windows: list[tuple[float, float
     if not tracks:
         return None
     return CompositeAudioClip(tracks).with_duration(total)
+
+
+def _shot_value(shot: "Shot") -> float:
+    """How much a clip shot is worth keeping, for dropping when over length."""
+    score = shot.entry.quality_score
+    return 0.5 if score is None else float(score)
+
+
+def drop_to_fit(shots: list["Shot"], excess: float, cfg: AssembleConfig) -> int:
+    """Remove the weakest clip shots until about `excess` seconds are gone.
+
+    Title cards stay unless their day loses every clip; the closing card always
+    stays, and so does at least one clip. Returns how many shots were removed.
+    """
+    clips = [s for s in shots if s.kind == "clip"]
+    if len(clips) <= 1:
+        return 0
+    # weakest first; among equals, the longest saves the most
+    order = sorted(clips, key=lambda s: (_shot_value(s), -s.duration))
+    removed, freed = set(), 0.0
+    for shot in order[:-1]:
+        if freed >= excess:
+            break
+        removed.add(id(shot))
+        overlap = cfg.crossfade if shot.transition == "crossfade" else 0.0
+        freed += max(0.0, shot.duration - overlap)
+    kept = [s for s in shots if id(s) not in removed]
+    # a day card with nothing left under it goes too
+    cleaned = []
+    for index, shot in enumerate(kept):
+        if shot.kind == "day":
+            nxt = kept[index + 1] if index + 1 < len(kept) else None
+            if nxt is None or nxt.kind != "clip":
+                removed.add(id(shot))
+                continue
+        cleaned.append(shot)
+    count = len(shots) - len(cleaned)
+    shots[:] = cleaned
+    return count
+
+
+def fit_to_music(shots: list["Shot"], music, limit: float | None,
+                 cfg: AssembleConfig) -> list[tuple["Shot", float, float]]:
+    """Fit, beat-sync and frame-align the shots, then schedule them.
+
+    With a `limit` (the music's length) the film is kept within it: if videos
+    and title cards cannot be squeezed enough, the weakest shots are dropped
+    and the fit is redone, and as a last resort the final shots are shortened.
+    """
+    frame = 1.0 / max(cfg.fps, 1)
+    natural = {id(s): s.duration for s in shots}
+    if limit and cfg.target_duration:
+        cfg = replace(cfg, target_duration=min(cfg.target_duration, limit))
+    dropped = 0
+    while True:
+        for shot in shots:
+            shot.duration = natural[id(shot)]
+        fit_to_duration(shots, cfg)
+        sync_to_music(shots, music, cfg)
+        # Put every shot on the frame grid before anything is scheduled. Cuts
+        # then land on real frames, and a chunked render and a single-pass one
+        # agree to the frame instead of drifting apart at each boundary.
+        for shot in shots:
+            shot.duration = max(frame, round(shot.duration / frame) * frame)
+        schedule = schedule_shots(shots, cfg)
+        total = schedule[-1][1] + schedule[-1][2]
+        if not limit or total <= limit + 1e-6:
+            break
+        count = drop_to_fit(shots, total - limit, cfg)
+        if not count:
+            break
+        dropped += count
+    if dropped:
+        log.warning("dropped %d shot(s) to keep the film within the music (%.0fs); "
+                    "use --allow-overtime to keep them and loop the music", dropped, limit)
+
+    if limit and total > limit + 1e-6:
+        # one clip still longer than the music: shorten from the end
+        excess = total - limit
+        for shot in reversed(shots):
+            room = max(0.0, shot.duration - max(frame, 1.0))
+            cut = min(math.ceil(excess / frame - 1e-9) * frame, room)
+            shot.duration -= cut
+            excess -= cut
+            if excess <= 1e-6:
+                break
+        log.warning("shortened the ending to stay within the music (%.0fs)", limit)
+        schedule = schedule_shots(shots, cfg)
+    return schedule
 
 
 # --------------------------------------------------------------- assembly
@@ -2070,8 +2167,11 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
     # transitions first (they decide the overlaps), then the length, then the
     # fine timing - each step depends on the one before it
     choose_transitions(shots, music, cfg)
-    fit_to_duration(shots, cfg)
-    sync_to_music(shots, music, cfg)
+    limit = None
+    if not cfg.allow_overtime:
+        limit = music_bed_length(music_files(music_path), cfg) or None
+    schedule = fit_to_music(shots, music, limit, cfg)
+    total = schedule[-1][1] + schedule[-1][2]
 
     # attach each shot's map, so a worker process needs nothing else
     for shot in shots:
@@ -2079,15 +2179,6 @@ def assemble(timeline: Timeline, plan: NarrativePlan, music_path, output_path: s
                 and shot.plan_index < len(map_tracks):
             shot.map_track = map_tracks[shot.plan_index]
 
-    # Put every shot on the frame grid before anything is scheduled. Cuts then
-    # land on real frames, and a chunked render and a single-pass one agree to
-    # the frame instead of drifting apart by the rounding at each boundary.
-    frame = 1.0 / max(cfg.fps, 1)
-    for shot in shots:
-        shot.duration = max(frame, round(shot.duration / frame) * frame)
-
-    schedule = schedule_shots(shots, cfg)
-    total = schedule[-1][1] + schedule[-1][2]
 
     # --- the soundtrack, built once against the global timeline -----------
     clip_audio, duck_windows = [], []

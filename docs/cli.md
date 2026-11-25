@@ -55,6 +55,7 @@ Options described in the other pages:
 --vertical              1080x1920 phone layout                  (layout.md)
 --blur-nudity           blur explicit regions (needs nudenet)    (editing.md)
 --nudity-threshold 0.40 how sure the detector has to be          (editing.md)
+--allow-overtime        run past the music and loop it           (editing.md)
 --no-beat-sync          ignore the music, cut on even timing     (audio.md)
 --beat-strength 0.7     how far shot pacing follows the energy   (audio.md)
 --workers 4             how many parts of the film render at once (performance.md)

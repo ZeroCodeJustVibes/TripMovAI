@@ -122,6 +122,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="do not end on the quote and the full route")
     extra.add_argument("--no-animation", action="store_true",
                        help="hold each picture still instead of easing it in and out")
+    extra.add_argument("--allow-overtime", action="store_true",
+                       help="let the film run longer than the music and loop it; "
+                            "by default shots are dropped so the film ends with the music")
     extra.add_argument("--no-beat-sync", action="store_true",
                        help="do not cut to the music")
     extra.add_argument("--beat-strength", type=float, default=0.7,
@@ -479,6 +482,7 @@ def run(args: argparse.Namespace) -> int:
         animate_cards=not args.no_animation,
         beat_sync=not args.no_beat_sync,
         beat_sync_strength=args.beat_strength,
+        allow_overtime=args.allow_overtime,
     )
     music_map = None
     if not args.no_beat_sync:
@@ -488,10 +492,15 @@ def run(args: argparse.Namespace) -> int:
             console.print(f"[dim]{music_map.tempo:.0f} BPM, {len(music_map.beats)} beats, "
                           f"{len(music_map.drops)} drop(s)[/dim]")
 
+    bed = assemble_mod.music_bed_length(music, cfg)
+    if target is not None and bed > 0 and target > bed and not args.allow_overtime:
+        console.print(f"[yellow]--duration {args.duration} is longer than the music "
+                      f"({bed / 60:.1f} min)[/yellow] - capping at the music. "
+                      f"Use --allow-overtime to loop the music instead.")
+        cfg = dataclasses.replace(cfg, target_duration=bed)
     if target is None:
         # no length asked for: run exactly as long as the music does, so the
         # film ends with the last song instead of looping or cutting it
-        bed = assemble_mod.music_bed_length(music, cfg)
         if bed > 0:
             cfg = dataclasses.replace(cfg, target_duration=bed)
             console.print(f"[dim]no --duration given: matching the music, "
@@ -502,10 +511,13 @@ def run(args: argparse.Namespace) -> int:
                         for e in timeline.selected if e.is_video)
             floor += sum(cfg.min_photo_duration for e in timeline.selected if not e.is_video)
             if floor > bed * 1.05:
+                outcome = ("the film will be longer and the music will loop"
+                           if args.allow_overtime else
+                           "the weakest shots will be dropped to end with the music "
+                           "(--allow-overtime keeps them and loops the music)")
                 console.print(f"[yellow]the clips alone run about {floor / 60:.1f} min, "
-                              f"longer than the music[/yellow] - the film will be longer "
-                              f"and the music will loop. Use --max-video-duration or "
-                              f"--max-clips to tighten it, or --duration to force a length.")
+                              f"longer than the music[/yellow] - {outcome}. "
+                              f"Use --max-video-duration or --max-clips to tighten it.")
 
     estimated = sum(assemble_mod.clip_duration(e, cfg) for e in timeline.selected)
     console.print(f"[dim]~{estimated / 60:.1f} min of footage at "
