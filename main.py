@@ -45,12 +45,88 @@ log = logging.getLogger("trip_video")
 
 # ------------------------------------------------------------------- CLI
 
+PRESETS_FILE = Path(__file__).resolve().parent / "presets.yaml"
+
+
+def load_presets(path: Path = PRESETS_FILE) -> dict[str, dict]:
+    """All named presets in `presets.yaml`, or {} if the file is missing."""
+    if not path.is_file():
+        return {}
+    import yaml
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must map preset names to settings")
+    return data
+
+
+def resolve_preset(name: str, parser: argparse.ArgumentParser) -> dict:
+    """Turn `--preset NAME|FILE.yaml` into argparse defaults (dest -> value)."""
+    if name.endswith((".yaml", ".yml")) or Path(name).is_file():
+        import yaml
+
+        path = Path(name)
+        if not path.is_file():
+            raise SystemExit(f"--preset file not found: {path}")
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    else:
+        presets = load_presets()
+        if name not in presets:
+            known = ", ".join(sorted(presets)) or "none"
+            raise SystemExit(f"unknown --preset {name!r} (known: {known})")
+        raw = presets[name] or {}
+    if not isinstance(raw, dict):
+        raise SystemExit(f"--preset {name!r} must be a mapping of option: value")
+
+    actions = {a.dest: a for a in parser._actions}
+    defaults = {}
+    for key, value in raw.items():
+        if key == "description":
+            continue
+        dest = str(key).lstrip("-").replace("-", "_")
+        if dest not in actions or dest in ("help", "preset", "list_presets"):
+            raise SystemExit(f"--preset {name!r}: unknown option {key!r}")
+        action = actions[dest]
+        if action.type is not None and value is not None and not isinstance(value, bool):
+            value = action.type(value)
+        elif isinstance(action, argparse._StoreTrueAction):
+            value = bool(value)
+        elif action.nargs == "+" and not isinstance(value, list):
+            value = [value]
+        elif action.type is None and isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
+        if action.choices is not None and value not in action.choices:
+            raise SystemExit(f"--preset {name!r}: {key} must be one of {sorted(action.choices)}")
+        defaults[dest] = value
+    return defaults
+
+
+def print_presets() -> None:
+    presets = load_presets()
+    if not presets:
+        console.print(f"no presets found in {PRESETS_FILE}")
+        return
+    table = Table(title=f"presets ({PRESETS_FILE.name})", title_justify="left", box=None, padding=(0, 2))
+    table.add_column("name", style="bold")
+    table.add_column("description")
+    table.add_column("settings", style="dim")
+    for name, cfg in presets.items():
+        cfg = cfg or {}
+        settings = "  ".join(f"{k}={v}" for k, v in cfg.items() if k != "description")
+        table.add_row(name, str(cfg.get("description", "")), settings)
+    console.print(table)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="main.py",
         description="Turn a folder of trip photos and videos into a polished recap video.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--preset", default=None, metavar="NAME|FILE",
+                   help="trip type from presets.yaml (sailing, hiking, mountaineering, vacation, "
+                        "roadtrip) or a .yaml file; sets defaults, explicit flags still win")
+    p.add_argument("--list-presets", action="store_true", help="show the available presets and exit")
     p.add_argument("--input", required=True, help="folder of exported photos/videos (searched recursively)")
     p.add_argument("--music", required=True, nargs="+", metavar="PATH",
                    help="background music: one file, several files played in order, "
@@ -101,7 +177,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     extra.add_argument("--whisper-model", default=understand_mod.WHISPER_MODEL, help="Whisper model size")
     extra.add_argument("--blip-model", default=understand_mod.BLIP2_MODEL, help="BLIP-2 model id")
     extra.add_argument("--fps", type=int, default=30, help="output frame rate")
-    extra.add_argument("--preset", default="medium", help="x264 preset (ultrafast..veryslow)")
+    extra.add_argument("--x264-preset", default="medium", help="x264 encoder preset (ultrafast..veryslow)")
     extra.add_argument("--threads", type=int, default=0, help="encoder threads (0 = ffmpeg default)")
     extra.add_argument("--workers", type=int, default=4,
                        help="how many parts of the film render at once")
@@ -118,6 +194,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="never show two tall photos side by side")
     extra.add_argument("--no-day-cards", action="store_true",
                        help="do not open each day with a title card")
+    extra.add_argument("--opening-card-only", action="store_true",
+                       help="one title card at the start for the whole trip, not one per day")
     extra.add_argument("--no-closing-card", action="store_true",
                        help="do not end on the quote and the full route")
     extra.add_argument("--no-animation", action="store_true",
@@ -151,6 +229,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="skip reverse geocoding, so no location headers")
     extra.add_argument("--dry-run", action="store_true", help="run every phase except the final render")
     extra.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+
+    # --preset / --list-presets are read first, so a preset can supply defaults
+    # that the real parse then lets explicit flags override.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--preset", default=None)
+    pre.add_argument("--list-presets", action="store_true")
+    early, _ = pre.parse_known_args(argv)
+    if early.list_presets:
+        print_presets()
+        raise SystemExit(0)
+    if early.preset:
+        p.set_defaults(**resolve_preset(early.preset, p))
     return p.parse_args(argv)
 
 
@@ -262,6 +352,8 @@ def run(args: argparse.Namespace) -> int:
     loaded = load_env_file(Path(__file__).resolve().parent / ".env")
     if loaded:
         console.print(f"[dim]loaded {', '.join(loaded)} from .env[/dim]")
+    if args.preset:
+        console.print(f"[cyan]preset:[/cyan] {args.preset}")
     input_dir = Path(args.input)
     if not input_dir.is_dir():
         console.print(f"[red]input folder not found:[/red] {input_dir}")
@@ -470,7 +562,7 @@ def run(args: argparse.Namespace) -> int:
         normalize_audio=not args.no_normalize_audio,
         clip_target_db=args.audio_target,
         duck_volume=args.music_duck,
-        preset=args.preset,
+        preset=args.x264_preset,
         threads=args.threads,
         workers=args.workers,
         chunk_size=args.chunk_size,
@@ -478,6 +570,7 @@ def run(args: argparse.Namespace) -> int:
         show_location=not args.no_location,
         pair_portraits=not args.no_pair_portraits,
         day_cards=not args.no_day_cards,
+        opening_card_only=args.opening_card_only,
         closing_card=not args.no_closing_card,
         animate_cards=not args.no_animation,
         beat_sync=not args.no_beat_sync,

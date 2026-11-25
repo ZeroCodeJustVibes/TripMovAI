@@ -1,8 +1,22 @@
 # CLI reference
 
+## Presets
+
+`--preset NAME` loads default settings for a kind of trip from
+[`presets.yaml`](../presets.yaml): `sailing`, `hiking`, `mountaineering`,
+`vacation`, `roadtrip`. A preset only changes defaults, so any flag you pass
+explicitly still wins. `--preset my.yaml` loads your own file (option: value
+pairs, same names as the flags), and `--list-presets` shows what each one sets.
+
+```bash
+python main.py --preset hiking --map-zoom 12 --input ./export --music song.mp3 --output trip.mp4
+```
+
 ## CLI
 
 ```
+--preset NAME|FILE        trip type from presets.yaml, or a .yaml file
+--list-presets            show the presets and exit
 --input PATH              input folder, searched recursively        (required)
 --music PATH...           one song, several in order, or a folder   (required)
 --output PATH             output .mp4                               (required)
@@ -28,7 +42,7 @@
 ```
 
 Extras beyond the brief: `--skip-select`, `--work-dir`, `--timeline`,
-`--device`, `--whisper-model`, `--blip-model`, `--fps`, `--preset`,
+`--device`, `--whisper-model`, `--blip-model`, `--fps`, `--x264-preset`,
 `--threads`, `--resolution`, `--dry-run`, `-v`, plus the map
 controls:
 
@@ -39,6 +53,7 @@ controls:
 --no-location           hide the location line under the caption
 --no-pair-portraits     never put two tall photos side by side
 --no-day-cards          skip the per-day title cards
+--opening-card-only     one title card for the whole trip instead of one per day
 --no-closing-card       skip the quote-and-full-route finale
 --no-animation          hold each picture still instead of easing it in and out
 --map-tilt 0.16         slight rake, so the shaded ridges read as height

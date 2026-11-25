@@ -69,6 +69,7 @@ class AssembleConfig:
 
     # --- chapters, finale and motion ------------------------------------
     day_cards: bool = True             # a title card at the start of each day
+    opening_card_only: bool = False    # one card for the whole trip instead of one per day
     day_card_duration: float = 4.0
     day_card_images: int = 3           # up to this many photos on a day card
     day_card_gallery_height: float = 0.34   # of frame height
@@ -1205,6 +1206,16 @@ def format_day_label(date_key: str, index: int) -> tuple[str, str]:
         return f"DAY {index}", date_key
 
 
+def trip_label(entries: list) -> tuple[str, str]:
+    """("5 DAYS", "Mon 03 Aug - Fri 07 Aug") - the opening card for the whole trip."""
+    days = sorted({day_of(e) for e in entries if day_of(e)})
+    if not days:
+        return "", ""
+    eyebrow = f"{len(days)} DAY{'S' if len(days) != 1 else ''}"
+    first, last = format_day_label(days[0], 1)[1], format_day_label(days[-1], 1)[1]
+    return eyebrow, first if first == last else f"{first} - {last}"
+
+
 def trip_summary(timeline: Timeline, coords: list[tuple[float, float]] | None) -> str:
     """"6 days · 5 places · 214 km" for the closing card."""
     days = {day_of(e) for e in timeline.selected if day_of(e)}
@@ -1340,22 +1351,29 @@ def plan_shots(timeline: Timeline, plan: NarrativePlan, cfg: AssembleConfig,
 
     for plan_index, path, entry, companion in paired:
         day = day_of(entry)
-        if cfg.day_cards and day and day not in seen_days:
+        whole_trip = cfg.opening_card_only
+        if cfg.day_cards and day and (not seen_days if whole_trip else day not in seen_days):
             seen_days.add(day)
-            members = [e for _, _, e, _ in paired if day_of(e) == day]
+            if whole_trip:
+                members = [e for _, _, e, _ in paired]
+                eyebrow, date_label = trip_label(members)
+                track, map_name = list(range(len(resolved))), "trip.png"
+            else:
+                members = [e for _, _, e, _ in paired if day_of(e) == day]
+                eyebrow, date_label = format_day_label(day, len(seen_days))
+                track, map_name = day_indexes.get(day), f"day_{day}.png"
             # a row of three is too thin to read on a phone frame
             gallery = day_gallery(members, 2 if tall else cfg.day_card_images)
             hero = hero_for(members) or entry
-            eyebrow, date_label = format_day_label(day, len(seen_days))
             title = plan.day_titles.get(day) or date_label
             subtitle = date_label
             places = [e.place for e in members if e.place]
             if places:
                 subtitle = f"{date_label} · {max(set(places), key=places.count)}"
             day_map = None
-            if coords and day in day_indexes:
+            if coords and track:
                 day_map = map_render.render_track_map(
-                    coords, day_indexes[day], maps_dir / f"day_{day}.png",
+                    coords, track, maps_dir / map_name,
                     map_render.MapConfig(out_dir=maps_dir, cache_dir=Path(maps_dir).parent / "tile_cache",
                                          size=700))
             shots.append(Shot(entry=gallery[0] if gallery else hero,

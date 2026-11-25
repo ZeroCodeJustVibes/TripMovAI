@@ -23,7 +23,7 @@ where the map is flying and therefore cannot be flattened. (Reference point: 18
 clips including 6 videos, 1600x1066, 91 s of output, 6.5 min to render.)
 
 To iterate faster, re-run with `--skip-select --skip-understand
---skip-narrative` and add `--resolution 1280x720 --fps 24 --preset veryfast`;
+--skip-narrative` and add `--resolution 1280x720 --fps 24 --x264-preset veryfast`;
 drop those flags for the final pass.
 
 ## Speed and memory

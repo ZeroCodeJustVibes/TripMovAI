@@ -1833,3 +1833,53 @@ class TestVerticalLayout:
             layout = assemble.layout_for(media, self.PHONE, self.cfg)
             x, y, w, h = layout.card
             assert x >= 0 and y >= 0 and x + w <= 1080 and y + h <= 1920
+
+
+class TestPresets:
+    ARGS = ["--input", "x", "--music", "m.mp3", "--output", "o.mp4"]
+
+    def test_every_shipped_preset_parses(self):
+        import main
+        presets = main.load_presets()
+        assert {"sailing", "hiking", "mountaineering", "vacation", "roadtrip"} <= set(presets)
+        for name in presets:
+            main.parse_args(["--preset", name, *self.ARGS])
+
+    def test_preset_sets_defaults_and_flags_win(self):
+        import main
+        args = main.parse_args(["--preset", "vacation", *self.ARGS])
+        assert args.no_map and args.prefer_people
+        args = main.parse_args(["--preset", "hiking", "--map-zoom", "11", *self.ARGS])
+        assert args.map_zoom == 11 and args.map_tiles == "topo"
+
+    def test_custom_file_and_bad_keys(self, tmp_path):
+        import main
+        good = tmp_path / "mine.yaml"
+        good.write_text("map-zoom: 8\nno_day_cards: true\n")
+        args = main.parse_args(["--preset", str(good), *self.ARGS])
+        assert args.map_zoom == 8 and args.no_day_cards
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("not-an-option: 1\n")
+        with pytest.raises(SystemExit):
+            main.parse_args(["--preset", str(bad), *self.ARGS])
+        with pytest.raises(SystemExit):
+            main.parse_args(["--preset", "nope", *self.ARGS])
+
+
+class TestOpeningCard:
+    def test_trip_label_spans_the_days(self):
+        import assemble
+        from types import SimpleNamespace as NS
+        entries = [NS(timestamp=None, day=d) for d in ("2026-08-03", "2026-08-05", "2026-08-07")]
+        orig = assemble.day_of
+        assemble.day_of = lambda e: e.day
+        try:
+            assert assemble.trip_label(entries) == ("3 DAYS", "Mon 03 Aug - Fri 07 Aug")
+            assert assemble.trip_label(entries[:1]) == ("1 DAY", "Mon 03 Aug")
+        finally:
+            assemble.day_of = orig
+
+    def test_vacation_preset_keeps_one_card(self):
+        import main
+        args = main.parse_args(["--preset", "vacation", "--input", "x", "--music", "m", "--output", "o"])
+        assert args.opening_card_only and not args.no_day_cards and not args.no_closing_card

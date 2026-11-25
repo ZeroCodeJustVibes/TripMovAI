@@ -62,6 +62,9 @@ Pillow, which covers JPEG/PNG/MP4/MOV but is weaker on HEIC and on video GPS.
 python main.py --input ./export --music ./song.mp3 --output trip.mp4 \
   --resolution 1920x1080 --amount-labels 25%
 
+# defaults for the kind of trip: sailing, hiking, mountaineering, vacation, roadtrip
+python main.py --preset hiking --input ./export --music ./song.mp3 --output trip.mp4
+
 # phone / Instagram cut
 python main.py --input ./export --music ./song.mp3 --output reel.mp4 --vertical
 
